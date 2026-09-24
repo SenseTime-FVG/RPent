@@ -25,13 +25,21 @@ from typing import Any
 import pytest
 from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
-from pydantic_ai.messages import CachePoint, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    CachePoint,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage, RunUsage
 
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.llm import LLMClient, LLMConfig, LLMUsage, RetryPolicy
-from rpent.llm.client import build_model_settings
+from rpent.llm.client import _mark_recent_function_outputs, build_model_settings
 from rpent.llm.retry import RetryLoggingModel
 from rpent.planner.api_loop import _build_stats
 from rpent.planner.base import build_planner
@@ -79,26 +87,59 @@ def test_responses_explicit_cache_settings_and_breakpoint_wire_format() -> None:
         prompt_cache_key="robodojo-stable-v1",
         prompt_cache_mode="explicit",
         image_history_groups=2,
+        parallel_tool_calls=False,
     )
     model = config.build_model()
+    assert type(model).__name__ == "ExplicitCacheResponsesModel"
     settings = build_model_settings(model, 128)
     assert settings["openai_prompt_cache_key"] == "robodojo-stable-v1"
     assert settings["openai_prompt_cache_options"] == {"mode": "explicit"}
+    assert settings["parallel_tool_calls"] is False
     mapped = asyncio.run(
         model._map_user_prompt(UserPromptPart(content=["stable goal", CachePoint()]))
     )
     assert mapped["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
-    image = asyncio.run(
-        model._map_user_prompt(
-            UserPromptPart(
-                content=[
-                    BinaryContent(data=b"jpeg", media_type="image/jpeg"),
-                    CachePoint(),
-                ]
-            )
+    _, wire = asyncio.run(
+        model._map_messages(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content=["stable goal", CachePoint()])]
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name="move_eef",
+                            content="new robot state",
+                            tool_call_id="call-1",
+                        )
+                    ]
+                ),
+            ],
+            settings,
+            ModelRequestParameters(),
         )
     )
-    assert image["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert wire[1]["output"] == [
+        {
+            "type": "input_text",
+            "text": "new robot state",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }
+    ]
+    outputs = [
+        {"type": "function_call_output", "call_id": str(index), "output": str(index)}
+        for index in range(42)
+    ]
+    _mark_recent_function_outputs(outputs)
+    assert outputs[0]["output"] == "0"
+    assert outputs[1]["output"] == "1"
+    assert outputs[2]["output"] == [
+        {
+            "type": "input_text",
+            "text": "2",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }
+    ]
 
 
 def test_prompt_cache_configuration_rejects_incompatible_endpoints() -> None:
@@ -208,6 +249,11 @@ def test_http_failures_have_bounded_retries_and_sanitized_logs(
         False,
     ]
     assert all(record["status_code"] == status for record in records)
+    assert all(
+        record["response_body"]["body"] == {"prompt": "[redacted]"}
+        for record in records
+    )
+    assert (log_path.stat().st_mode & 0o777) == 0o600
     assert "private text" not in log_path.read_text()
     assert "secret-key" not in log_path.read_text()
     request_records = [
@@ -306,6 +352,48 @@ def test_failed_multimodal_request_logs_only_shape(
     assert "secret-key" not in log
 
 
+def test_http_500_logs_server_body_with_redaction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        raise ModelHTTPError(
+            500,
+            "offline",
+            body={
+                "error": {
+                    "code": "server_error",
+                    "type": "upstream_timeout",
+                    "message": "Internal Server Error: upstream timed out",
+                    "prompt": "private task text",
+                }
+            },
+            headers={"x-request-id": "request-123", "authorization": "secret-key"},
+        )
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+    client = LLMClient(
+        LLMConfig(
+            "openai", "offline", api_key="secret-key", retry=RetryPolicy(max_retries=0)
+        ),
+        log_path=tmp_path / "llm_errors.jsonl",
+    )
+    with pytest.raises(ModelHTTPError):
+        client.generate_sync("private task text")
+    record = json.loads((tmp_path / "llm_errors.jsonl").read_text().splitlines()[0])
+    assert record["server_error"]["code"] == "server_error"
+    assert record["server_error"]["type"] == "upstream_timeout"
+    assert record["server_error"]["x_request_id"] == "request-123"
+    assert (
+        record["server_error"]["message"] == "Internal Server Error: upstream timed out"
+    )
+    assert len(record["server_error"]["body_sha256"]) == 64
+    assert record["response_body"]["available"] is True
+    assert record["response_body"]["body"]["error"]["code"] == "server_error"
+    assert record["response_body"]["body"]["error"]["prompt"] == "[redacted]"
+    assert "private task text" not in (tmp_path / "llm_errors.jsonl").read_text()
+    assert "secret-key" not in (tmp_path / "llm_requests.jsonl").read_text()
+
+
 @pytest.mark.parametrize(
     ("error", "expected_attempts"),
     [(ModelAPIError("offline", "connection failed"), 3), (ValueError("bad data"), 1)],
@@ -337,6 +425,10 @@ def test_non_http_failures_are_logged_and_only_connection_errors_retry(
     with pytest.raises(type(error)):
         client.generate_sync("task")
     assert attempts == expected_attempts
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert all("response_body" in record for record in records)
+    if isinstance(error, ModelAPIError):
+        assert all(record["response_body"]["available"] is False for record in records)
     assert len(log_path.read_text().splitlines()) == expected_attempts
 
 

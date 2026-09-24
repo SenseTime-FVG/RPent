@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,6 +43,124 @@ if TYPE_CHECKING:
 
 logger = get_logger("llm.retry")
 _RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429}
+_SAFE_ERROR_VALUE = re.compile(r"[A-Za-z0-9_.:/ -]{1,128}\Z")
+_SAFE_MESSAGE = re.compile(r"[A-Za-z0-9_.:/(),;= -]{1,300}\Z")
+_DIAGNOSTIC_PREFIXES = (
+    "bad request",
+    "context",
+    "gateway",
+    "image",
+    "internal",
+    "invalid",
+    "maximum",
+    "model",
+    "overload",
+    "rate limit",
+    "server",
+    "timeout",
+    "token",
+    "too many",
+    "upstream",
+)
+_SENSITIVE_BODY_KEY = re.compile(
+    r"(?i)(?:authorization|api[_-]?key|password|secret|prompt(?:_text)?|"
+    r"input(?:_text|_image|_body)?|messages|image(?:_url|_data|_bytes)?|"
+    r"content(?:_text|_data)?|request_body)\Z"
+)
+
+
+def _redact_response_value(value: Any) -> Any:
+    """Retain server diagnostics while removing echoed requests and secrets."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): (
+                "[redacted]"
+                if _SENSITIVE_BODY_KEY.fullmatch(str(key))
+                else _redact_response_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_response_value(item) for item in value]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        value = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", value)
+        value = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted-key]", value)
+        value = re.sub(r"data:image/[^\s]+", "[redacted-image]", value)
+        return value
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return str(value)
+
+
+def _response_body_for_log(error: Exception) -> dict[str, Any]:
+    """Describe every API failure, including an explicitly absent response."""
+    body = getattr(error, "body", None)
+    return {
+        "available": body is not None,
+        "body": _redact_response_value(body) if body is not None else None,
+        "exception_message": (
+            f"HTTP {error.status_code}"
+            if isinstance(error, ModelHTTPError)
+            else _redact_response_value(str(error))
+        ),
+    }
+
+
+def _http_error_details(error: Exception | None) -> dict[str, Any] | None:
+    """Keep provider diagnostics without writing raw response bodies."""
+    if not isinstance(error, ModelHTTPError):
+        return None
+    body = error.body
+    serialized = json.dumps(body, sort_keys=True, default=str)
+    nested = body.get("error", body) if isinstance(body, dict) else body
+    details: dict[str, Any] = {
+        "body_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "body_type": type(body).__name__,
+    }
+    if isinstance(nested, dict):
+        for field in ("code", "type", "param"):
+            value = nested.get(field)
+            if isinstance(value, (str, int)) and _SAFE_ERROR_VALUE.fullmatch(
+                str(value)
+            ):
+                details[field] = str(value)
+        message = nested.get("message", nested.get("msg"))
+    else:
+        message = nested
+    if isinstance(message, str):
+        normalized = message.strip()
+        request_id = re.search(
+            r"(?i)request[ _-]?id\s*[:=]\s*([A-Za-z0-9_-]{6,128})", normalized
+        )
+        if request_id:
+            details["server_request_id"] = request_id.group(1)
+        if (
+            _SAFE_MESSAGE.fullmatch(normalized)
+            and normalized.lower().startswith(_DIAGNOSTIC_PREFIXES)
+            and not re.search(
+                r"(?i)sk-[a-z0-9]|bearer|api.?key|password|secret|authorization|data:image|base64|prompt",
+                normalized,
+            )
+        ):
+            details["message"] = normalized
+        else:
+            details["message_redacted"] = True
+    headers = error.headers or {}
+    for name in (
+        "x-request-id",
+        "request-id",
+        "x-ms-request-id",
+        "x-correlation-id",
+        "retry-after",
+    ):
+        value = next(
+            (value for key, value in headers.items() if key.lower() == name), None
+        )
+        if isinstance(value, str) and _SAFE_ERROR_VALUE.fullmatch(value):
+            details[name.replace("-", "_")] = value
+    return details
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +246,7 @@ def _request_shape(
 class RetryLoggingModel(WrapperModel):
     """Retry a failed model request without replaying completed robot tool calls.
 
-    Error records omit prompts, response bodies, and credentials. A stream is
+    Error files keep redacted response bodies; request logs omit them. A stream is
     retried only before it opens; replaying a partially consumed stream could
     duplicate output or downstream actions.
     """
@@ -154,7 +275,23 @@ class RetryLoggingModel(WrapperModel):
     def _write_record(self, path: Path, record: dict[str, Any]) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as file:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags, 0o600)
+            if os.geteuid() == 0:
+                for parent in path.parents:
+                    owner = parent.stat()
+                    if owner.st_uid != 0:
+                        try:
+                            os.fchown(fd, owner.st_uid, owner.st_gid)
+                        except OSError as ownership_error:
+                            logger.warning(
+                                "could not assign LLM log ownership: %s",
+                                ownership_error,
+                            )
+                        break
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as log_error:
             logger.warning("could not write LLM request log: %s", log_error)
@@ -186,6 +323,7 @@ class RetryLoggingModel(WrapperModel):
                 "status_code": (
                     error.status_code if isinstance(error, ModelHTTPError) else None
                 ),
+                "server_error": _http_error_details(error),
                 "request_shape": shape,
                 "usage": (
                     {
@@ -223,12 +361,14 @@ class RetryLoggingModel(WrapperModel):
             "retry_delay_s": delay,
             "request_id": request_id,
             "request_shape": shape,
+            "server_error": _http_error_details(exc),
             "elapsed_s": round(elapsed_s, 3),
         }
+        detailed_record = {**record, "response_body": _response_body_for_log(exc)}
         log = logger.warning if can_retry else logger.error
-        log("LLM request failed: %s", json.dumps(record, ensure_ascii=False))
+        log("LLM request failed: %s", json.dumps(detailed_record, ensure_ascii=False))
         if self.log_path is not None:
-            self._write_record(self.log_path, record)
+            self._write_record(self.log_path, detailed_record)
         return delay
 
     async def request(

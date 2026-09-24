@@ -1,5 +1,52 @@
 # RoboDojo with EmbodiedAgent
 
+## RoboProbe EEF episode example
+
+The new ``RoboDojo_EmbodiedAgent_EEF`` user policy keeps RoboProbe's
+``move_eef`` parsing and CuRobo trajectory planner. RPent owns one continuous
+LLM conversation per episode. The ``move_eef`` MCP call is handed to the
+RoboDojo client process; its tool result is returned only after Isaac executes
+the planned action and supplies a fresh robot state and three RGB views.
+RoboDojo owns task termination and native scoring. This policy uses one model
+response per accepted action, plus requests needed to repair rejected actions.
+
+Prepare a fresh workspace with the existing ``roboprobe_once/prepare.py``,
+then configure the EEF user demo. The runtime dependency directory must
+contain ``mcp`` and ``pydantic_ai`` for Python 3.11. Keep the model key outside
+Git; the configurator copies it into the experiment with mode ``0600``.
+
+```bash
+python roboprobe_once/prepare.py --experiment /path/to/new-experiment
+python RPent/examples/robodojo/configure_eef_experiment.py \
+  --experiment /path/to/new-experiment \
+  --repo /path/to/RPent \
+  --deps /path/to/python-dependencies \
+  --key-file /private/path/to/tokenhub-key
+python RPent/examples/robodojo/cache_gate_eef.py \
+  --source-experiment /path/to/scored-reference-experiment \
+  --experiment /path/to/new-experiment \
+  --output /path/to/new-experiment/cache-gate-001
+```
+
+The cache gate makes multimodal RPent model requests using recorded RoboDojo
+frames; it does not produce benchmark scores. It exits successfully only when
+the provider reports a token-weighted cache hit rate above 60%. After the
+gate and a bounded real task check, use the prepared ``manage.py`` to create
+and submit separate GPU shards, for example ``plan --jobs 16``. The manager
+keeps one native scored seed-0/layout-0 episode per task, and stores RPent
+usage and retry logs under each task trace's ``rpent`` directory. This
+54-task coverage run is distinct from RoboDojo's official multi-seed leaderboard.
+Each shard gets its own Warp, Torch, and CUDA compilation caches so parallel
+workers cannot read partially written kernels. The policy waits up to 2,100
+seconds for a tool call while model requests retry; set
+``L3_INSPECT_TOOL_CALL_TIMEOUT_S`` to override that limit.
+After scoring, run ``manage.py status`` and ``report_eef.py --experiment
+/path/to/new-experiment``. The report joins each native result to the same
+run's RPent request log and reports per-task calls, retries, tokens, and cache
+hit rate, plus the call-count median and P75.
+
+## Discrete-action RoboDawn example
+
 This adapter uses RPent's `EmbodiedAgent` for each model decision. Its MCP
 `snapshot` tool returns the three RoboDojo camera views, robot state, and execution
 feedback. A bounded RoboDawn demonstration enters the initial model context so

@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.usage import RequestUsage
 
 from rpent.embodied_agent import EmbodiedAgent, McpServer
 from rpent.llm import LLMConfig
@@ -135,6 +138,72 @@ def test_embodied_agent_discovers_calls_and_preserves_images(
         ("move_eef", {"pose": "invalid"}),
         ("snapshot", {}),
     ]
+
+
+def test_episode_hands_motion_to_benchmark_and_returns_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    robot = _RobotTools()
+    server = HttpMcpServer(robot)
+    server.start()
+    requests = 0
+
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        nonlocal requests
+        requests += 1
+        assert {tool.name for tool in info.function_tools} == {
+            "move_eef",
+            "snapshot",
+        }
+        if requests == 2:
+            assert "executed" in str(messages)
+            assert "BinaryContent" in str(messages)
+        return ModelResponse(
+            parts=[ToolCallPart("move_eef", {"pose": "target"})],
+            usage=RequestUsage(input_tokens=10, output_tokens=2),
+        )
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+    agent = EmbodiedAgent(
+        mcp_servers=[McpServer(name="robot", url=server.url, expose_unprefixed=True)],
+        output_dir=tmp_path / "episode",
+        llm=LLMConfig("openai", "offline", api_key="test"),
+        max_turns=3,
+    )
+    try:
+        with agent.start_episode(
+            "Pick up the object.",
+            system_prompt="Call move_eef once.",
+            deferred_tools=["move_eef"],
+        ) as episode:
+            call = episode.next_call(timeout=10)
+            assert call is not None
+            assert call.name == "move_eef"
+            assert call.arguments == {"pose": "target"}
+            with pytest.raises(ValueError, match="name does not match"):
+                episode.complete(call, ToolResult("robot__snapshot", {}))
+            episode.complete(
+                call,
+                ToolResult(
+                    call.name,
+                    {"status": "executed", "_image_bytes": b"png"},
+                ),
+            )
+            next_call = episode.next_call(timeout=10)
+            assert next_call is not None
+            episode.complete(
+                next_call,
+                ToolResult(next_call.name, {"_finish": True, "status": "native_end"}),
+            )
+            result = episode.wait(timeout=10)
+    finally:
+        server.stop()
+
+    assert requests == 2
+    assert result.finish_result is not None
+    assert result.finish_result["status"] == "native_end"
+    assert result.stats["requests"] == 2
+    assert robot.calls == []
 
 
 def test_embodied_agent_rejects_invalid_server_config(tmp_path: Path) -> None:

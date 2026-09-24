@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import queue
 from pathlib import Path
 from typing import Any
@@ -160,7 +161,7 @@ def test_successful_finish_waits_for_its_tool_result() -> None:
     assert any(isinstance(event, UsageEvent) for event in sink.events)
 
 
-def test_multimodal_initial_context_precedes_cache_breakpoint() -> None:
+def test_task_breakpoint_precedes_multimodal_initial_context() -> None:
     image = BinaryContent(data=b"jpeg-data", media_type="image/jpeg")
 
     def model(messages: list[Any], info: Any) -> ModelResponse:
@@ -171,7 +172,13 @@ def test_multimodal_initial_context_precedes_cache_breakpoint() -> None:
             for part in message.parts
             if isinstance(part, UserPromptPart)
         )
-        assert user.content == ["task", "stable demo", image, CachePoint()]
+        assert user.content == [
+            "task",
+            CachePoint(),
+            "stable demo",
+            image,
+            CachePoint(),
+        ]
         return ModelResponse(
             parts=[
                 ToolCallPart(
@@ -269,6 +276,48 @@ def test_rejected_finish_does_not_end_the_run() -> None:
     )
 
 
+def test_required_tool_call_repairs_text_reply_in_same_history() -> None:
+    requests = 0
+
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        nonlocal requests
+        del info
+        requests += 1
+        if requests == 1:
+            return ModelResponse(
+                parts=[TextPart("I will move the arm.")],
+                usage=RequestUsage(input_tokens=10, output_tokens=2),
+            )
+        assert "I will move the arm" in str(messages)
+        assert "Reply with exactly one tool call" in str(messages)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "finish", {"status": "success", "summary": "done"}, "finish-call"
+                )
+            ],
+            usage=RequestUsage(input_tokens=12, output_tokens=3),
+        )
+
+    planner = ApiAgentLoop(
+        FunctionModel(model),
+        dashboard_events=RecordingSink(),
+        require_tool_call=True,
+    )
+    result = planner.solve(
+        system_prompt="Use tools.",
+        user_message="task",
+        toolkit=FakeToolkit(),
+        max_turns=3,
+    )
+    assert result.error is None
+    assert requests == 2
+    assert result.stats["requests"] == 2
+    assert result.stats["total_input_tokens"] == 22
+    assert result.finish_result["status"] == "success"
+    assert result.stats["tool_calls"] == 1
+
+
 def test_backend_failure_is_returned_without_escaping() -> None:
     def model(messages: list[Any], info: Any) -> ModelResponse:
         del messages, info
@@ -279,6 +328,39 @@ def test_backend_failure_is_returned_without_escaping() -> None:
     assert result.finish_result is None
     assert result.error == "RuntimeError: provider failed"
     assert result.messages == [{"role": "user", "content": "complete the task"}]
+
+
+def test_backend_failure_retains_usage_from_earlier_response() -> None:
+    attempts = 0
+
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        nonlocal attempts
+        del messages, info
+        attempts += 1
+        if attempts == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "finish",
+                        {"status": "success", "summary": "too early"},
+                        "rejected-finish",
+                    )
+                ],
+                usage=RequestUsage(input_tokens=7, output_tokens=3),
+            )
+        raise ModelHTTPError(500, "provider failed")
+
+    result = solve_with_model(
+        model,
+        FakeToolkit({"error": "finish refused by environment"}),
+        RecordingSink(),
+    )
+
+    assert result.error is not None
+    assert "500" in result.error
+    assert result.stats["requests"] == 1
+    assert result.stats["total_input_tokens"] == 7
+    assert result.stats["total_output_tokens"] == 3
 
 
 def test_image_policy_error_is_not_misdiagnosed_as_text_only_model() -> None:
@@ -356,6 +438,9 @@ def test_tool_schema_and_dispatch_are_mapped_to_pydantic_ai() -> None:
         finish.function_schema.json_schema
         == toolkit.get_tools_spec()[0]["input_schema"]
     )
+    assert [
+        tool.name for tool in _build_tools(toolkit, include_image_reader=False)
+    ] == ["finish"]
 
 
 def test_tool_result_conversion_keeps_text_and_images_separate() -> None:
@@ -380,6 +465,29 @@ def test_tool_result_conversion_keeps_text_and_images_separate() -> None:
     assert blocks[1]["source"]["data"] == encoded
 
 
+def test_tool_result_preserves_state_camera_label_order() -> None:
+    encoded = base64.b64encode(b"frame").decode()
+    blocks = [
+        {"type": "text", "text": "accepted"},
+        {"type": "text", "text": "state"},
+        {"type": "text", "text": "camera 'head':"},
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": encoded,
+            },
+        },
+        {"type": "text", "text": "camera 'left_wrist':"},
+    ]
+    text, content = _content_blocks_to_pydantic(blocks)
+    assert text == "accepted"
+    assert content[:2] == ["state", "camera 'head':"]
+    assert isinstance(content[2], BinaryContent)
+    assert content[3] == "camera 'left_wrist':"
+
+
 def test_no_images_mode_suppresses_binary_tool_content() -> None:
     toolkit = FakeToolkit({"value": "visible", "_image_bytes": b"secret pixels"})
 
@@ -400,12 +508,23 @@ def test_no_images_mode_suppresses_binary_tool_content() -> None:
     assert "secret" not in text_only
 
 
-def test_explicit_cache_marks_multimodal_tool_feedback() -> None:
+def test_multimodal_tool_feedback_keeps_camera_content_separate() -> None:
     toolkit = FakeToolkit({"value": "visible", "_image_bytes": b"pixels"})
-    result = _make_tool_function(toolkit, "snapshot", cache_breakpoints=True)()
+    result = _make_tool_function(toolkit, "snapshot")()
     assert isinstance(result, ToolReturn)
     assert isinstance(result.content[0], BinaryContent)
-    assert isinstance(result.content[-1], CachePoint)
+    assert len(result.content) == 1
+
+
+def test_terminal_tool_signal_survives_custom_observation_text() -> None:
+    class TerminalToolkit(FakeToolkit):
+        def execute_tool(self, name: str, args: dict[str, Any]) -> ToolResult:
+            result = ToolResult(name, {"_finish": True, "status": "native_end"})
+            result.content_blocks = [{"type": "text", "text": "final camera state"}]
+            return result
+
+    result = _make_tool_function(TerminalToolkit(), "move_eef")()
+    assert json.loads(result)["_finish"] is True
 
 
 def test_image_history_keeps_only_two_recent_observation_groups() -> None:
@@ -425,3 +544,55 @@ def test_image_history_keeps_only_two_recent_observation_groups() -> None:
         isinstance(message.parts[0].content[0], BinaryContent) for message in pruned[1:]
     )
     assert isinstance(messages[0].parts[0].content[0], BinaryContent)
+
+
+def test_image_history_preserves_initial_demonstration_prefix() -> None:
+    messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=[BinaryContent(data=bytes([index]), media_type="image/png")]
+                )
+            ]
+        )
+        for index in range(4)
+    ]
+    pruned = _prune_history_images(
+        messages, max_groups=2, preserve_initial_image_count=1
+    )
+    assert isinstance(pruned[0].parts[0].content[0], BinaryContent)
+    assert isinstance(pruned[1].parts[0].content[0], str)
+    assert all(
+        isinstance(message.parts[0].content[0], BinaryContent) for message in pruned[2:]
+    )
+
+
+def test_initial_live_image_ages_out_after_two_tool_observations() -> None:
+    initial = ModelRequest(
+        parts=[
+            UserPromptPart(
+                content=[
+                    "demo",
+                    BinaryContent(data=b"demo", media_type="image/png"),
+                    "live",
+                    BinaryContent(data=b"first", media_type="image/png"),
+                ]
+            )
+        ]
+    )
+    updates = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=[BinaryContent(data=b"camera", media_type="image/png")]
+                )
+            ]
+        )
+        for _ in range(2)
+    ]
+    pruned = _prune_history_images(
+        [initial, *updates], max_groups=2, preserve_initial_image_count=1
+    )
+    initial_content = pruned[0].parts[0].content
+    assert isinstance(initial_content[1], BinaryContent)
+    assert isinstance(initial_content[3], str)

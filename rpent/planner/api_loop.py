@@ -100,6 +100,9 @@ class ApiAgentLoop:
         timeout_s: int | None = None,
         cache_breakpoints: bool = False,
         image_history_groups: int | None = None,
+        preserve_initial_image_count: int = 0,
+        include_image_reader: bool = True,
+        require_tool_call: bool = False,
     ):
         """Store the pydantic-ai model and the output-token cap."""
         self._model = model
@@ -109,6 +112,9 @@ class ApiAgentLoop:
         self._timeout_s = timeout_s
         self._cache_breakpoints = cache_breakpoints
         self._image_history_groups = image_history_groups
+        self._preserve_initial_image_count = preserve_initial_image_count
+        self._include_image_reader = include_image_reader
+        self._require_tool_call = require_tool_call
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         self._reasoning_effort = reasoning_effort
@@ -186,6 +192,7 @@ class ApiAgentLoop:
         last_error: str | None = None
         usage: RunUsage | None = None
         quit_requested = False
+        no_tool_repairs = 0
 
         def _inject_pending(run: Any) -> bool:
             """Drain queued user lines into the live run; True => end session.
@@ -232,14 +239,20 @@ class ApiAgentLoop:
             )
         else:
             seed = (
-                [*user_message, CachePoint()]
+                [user_message[0], CachePoint(), *user_message[1:], CachePoint()]
                 if self._cache_breakpoints
                 else user_message
             )
         history: list[ModelMessage] | None = None
+        active_run: Any | None = None
+        active_run_counted = False
         try:
             while True:
                 run_turns = 0
+                ended_without_tool = False
+                last_response_tool_calls = 0
+                active_run = None
+                active_run_counted = False
                 # request_limit overrides pydantic-ai's default (50) so the
                 # manual max_turns break below is what bounds each run.
                 async with agent.iter(
@@ -247,6 +260,7 @@ class ApiAgentLoop:
                     message_history=history,
                     usage_limits=UsageLimits(request_limit=max_turns + 1),
                 ) as run:
+                    active_run = run
                     async for node in run:
                         if interactive and _inject_pending(run):
                             quit_requested = True
@@ -259,9 +273,15 @@ class ApiAgentLoop:
                                 log_turn=run_turns,
                             )
 
+                            tool_calls_before = observer.tool_calls
                             async with node.stream(run.ctx) as stream:
                                 async for event in stream:
                                     observer.observe_tool(event, run.usage)
+                            last_response_tool_calls = (
+                                observer.tool_calls - tool_calls_before
+                            )
+                            if last_response_tool_calls:
+                                no_tool_repairs = 0
 
                             if observer.finish_result is not None:
                                 logger.info("FINISH called: %s", observer.finish_result)
@@ -272,6 +292,10 @@ class ApiAgentLoop:
                                 )
                                 break
                         elif Agent.is_end_node(node):
+                            ended_without_tool = (
+                                last_response_tool_calls == 0
+                                and observer.finish_result is None
+                            )
                             if interactive:
                                 logger.info(
                                     "model ended turn without a tool call "
@@ -283,9 +307,24 @@ class ApiAgentLoop:
                                 )
                             break
 
-                    usage = run.usage
-                    if interactive:
+                    usage = run.usage if usage is None else usage + run.usage
+                    active_run_counted = True
+                    if interactive or (self._require_tool_call and ended_without_tool):
                         history = run.all_messages()
+
+                if (
+                    self._require_tool_call
+                    and ended_without_tool
+                    and observer.turns < max_turns
+                    and not quit_requested
+                ):
+                    no_tool_repairs += 1
+                    if no_tool_repairs >= 3:
+                        last_error = "model kept failing to produce a tool call"
+                        break
+                    seed = "Reply with exactly one tool call from the provided tools."
+                    messages.append({"role": "user", "content": seed})
+                    continue
 
                 # finish, quit, non-interactive, or the cumulative turn budget is
                 # spent => end the whole session so max_turns is enforced across
@@ -305,6 +344,14 @@ class ApiAgentLoop:
         except UsageLimitExceeded as e:
             logger.info("usage limit reached: %s", e)
         except Exception as e:  # noqa: BLE001 - surfaced via PlannerResult.error
+            # A later request can fail after earlier responses succeeded in
+            # this run. Preserve their token usage in the episode summary.
+            if active_run is not None and not active_run_counted:
+                usage = (
+                    active_run.usage
+                    if usage is None
+                    else usage + active_run.usage
+                )
             last_error = _api_error_text(e, no_images=self._no_images)
             logger.error("agent run failed: %s", last_error)
 
@@ -405,7 +452,7 @@ class ApiAgentLoop:
             tools=_build_tools(
                 toolkit,
                 no_images=self._no_images,
-                cache_breakpoints=self._cache_breakpoints,
+                include_image_reader=self._include_image_reader,
             ),
             model_settings=_build_model_settings(self._model, self._max_tokens),
             capabilities=[
@@ -414,6 +461,7 @@ class ApiAgentLoop:
                     processor=partial(
                         _prune_history_images,
                         max_groups=self._image_history_groups,
+                        preserve_initial_image_count=self._preserve_initial_image_count,
                     )
                 ),
             ],
@@ -478,6 +526,13 @@ class _ApiRunObserver:
             _log_tool_result(message)
             part = event.part
             is_error = bool(getattr(part, "is_error", False))
+            if not is_error:
+                try:
+                    terminal = json.loads(message["content"])
+                except (TypeError, ValueError):
+                    terminal = None
+                if isinstance(terminal, dict) and terminal.get("_finish") is True:
+                    self.finish_result = terminal
             if self.pending_finish is not None:
                 if not is_error and "finish refused" not in str(message):
                     self.finish_result = self.pending_finish
@@ -679,7 +734,10 @@ def _build_model_settings(model: Model, max_tokens: int) -> ModelSettings:
 
 
 def _prune_history_images(
-    messages: list[ModelMessage], *, max_groups: int | None = None
+    messages: list[ModelMessage],
+    *,
+    max_groups: int | None = None,
+    preserve_initial_image_count: int = 0,
 ) -> list[ModelMessage]:
     """Replace older image groups with text and bound recent image bytes."""
     # Every image in history, oldest -> newest: (msg_idx, part_idx, item_idx, nbytes).
@@ -699,18 +757,24 @@ def _prune_history_images(
     if not located:
         return messages
 
-    groups = list(dict.fromkeys((mi, pi) for mi, pi, _, _ in located))
+    # Demonstration images form a stable prefix; the initial live observation
+    # is dynamic and must age out like later observations.
+    protected = {entry[:3] for entry in located[:preserve_initial_image_count]}
+    dynamic = [entry for entry in located if entry[:3] not in protected]
+    groups = list(dict.fromkeys((mi, pi) for mi, pi, _, _ in dynamic))
     recent_groups = set(groups[-max_groups:]) if max_groups is not None else set(groups)
 
     # Walk newest -> oldest, keeping images while under the byte budget.
     keep: set[tuple[int, int, int]] = set()
     total = 0
-    for rank, (mi, pi, ii, nbytes) in enumerate(reversed(located)):
+    for rank, (mi, pi, ii, nbytes) in enumerate(reversed(dynamic)):
         if (mi, pi) in recent_groups and (
             rank < _MIN_RECENT_IMAGES or total + nbytes <= _MAX_HISTORY_IMAGE_BYTES
         ):
             keep.add((mi, pi, ii))
             total += nbytes
+
+    keep.update(protected)
 
     if len(keep) == len(located):
         return messages
@@ -779,13 +843,15 @@ def _build_tools(
     toolkit: Toolkit,
     *,
     no_images: bool = False,
-    cache_breakpoints: bool = False,
+    include_image_reader: bool = True,
 ) -> list[Tool]:
     """Build the API-only image reader plus pydantic-ai toolkit wrappers."""
-    image_reader = _make_image_reader(toolkit.state, no_images=no_images)
     # sequential=True serializes a turn's tool calls so the toolkit's
     # single-operation lock never rejects an overlapping call.
-    tools: list[Tool] = [Tool(image_reader, name="read_image", sequential=True)]
+    tools: list[Tool] = []
+    if include_image_reader:
+        image_reader = _make_image_reader(toolkit.state, no_images=no_images)
+        tools.append(Tool(image_reader, name="read_image", sequential=True))
     for spec in toolkit.get_tools_spec():
         name = spec["name"]
         tools.append(
@@ -794,7 +860,6 @@ def _build_tools(
                     toolkit,
                     name,
                     no_images=no_images,
-                    cache_breakpoints=cache_breakpoints,
                 ),
                 name=name,
                 description=spec.get("description", ""),
@@ -891,16 +956,20 @@ def _make_tool_function(
     name: str,
     *,
     no_images: bool = False,
-    cache_breakpoints: bool = False,
 ):
     """Return a callable that dispatches one tool call to the toolkit."""
 
     def _call(**kwargs: Any) -> Any:
         result = toolkit.execute_tool(name, kwargs)
-        text, images = _content_blocks_to_pydantic(result.content_blocks)
-        if images and not no_images:
-            content = [*images, CachePoint()] if cache_breakpoints else images
-            return ToolReturn(return_value=text, content=content)
+        text, user_content = _content_blocks_to_pydantic(result.content_blocks)
+        if result.is_finish:
+            text = json.dumps(result.result, ensure_ascii=False)
+        if no_images:
+            user_content = [
+                item for item in user_content if not isinstance(item, BinaryContent)
+            ]
+        if user_content:
+            return ToolReturn(return_value=text, content=user_content)
         return text
 
     _call.__name__ = name
@@ -909,26 +978,29 @@ def _make_tool_function(
 
 def _content_blocks_to_pydantic(
     blocks: list[dict[str, Any]],
-) -> tuple[str, list[BinaryContent]]:
-    """Split Anthropic-shaped content blocks into text and image content."""
-    text_parts: list[str] = []
-    images: list[BinaryContent] = []
+) -> tuple[str, list[str | BinaryContent]]:
+    """Use the first text block as tool output; preserve later block order."""
+    text: str | None = None
+    user_content: list[str | BinaryContent] = []
     for block in blocks:
         block_type = block.get("type")
         if block_type == "text":
-            text_parts.append(block.get("text", ""))
+            value = block.get("text", "")
+            if text is None:
+                text = value
+            else:
+                user_content.append(value)
         elif block_type == "image":
             source = block.get("source") or {}
             data = source.get("data")
             if source.get("type") == "base64" and data:
-                images.append(
+                user_content.append(
                     BinaryContent(
                         data=base64.b64decode(data),
                         media_type=source.get("media_type", "image/png"),
                     )
                 )
-    text = "\n\n".join(part for part in text_parts if part) or "{}"
-    return text, images
+    return text or "{}", user_content
 
 
 def _serialize_response(response: ModelResponse) -> dict[str, Any]:
