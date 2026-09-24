@@ -52,27 +52,64 @@ def _source_trace(source: Path, task: str) -> Path:
     return traces[0]
 
 
-def _feedback(name: str, frames: dict[str, bytes], turn: int, turns: int) -> ToolResult:
+def _recorded_parts(
+    trace_path: Path, trace: dict, turn: int
+) -> list[str | BinaryContent]:
+    recorded = trace["turns"][min(turn, len(trace["turns"]) - 1)]["observation"]
+    state = recorded["state"]
+    flange = recorded["flange"]
+    text = [
+        f"Instruction: {trace['instruction']}",
+        f"Recorded environment step: {recorded['env_step']}",
+        "Arm joint state (radians; read only):",
+        *(f"{name}={float(value):.4f}" for name, value in state.items()),
+        "Measured end effector flange poses (world frame):",
+        *(f"{name}={json.dumps(value)}" for name, value in flange.items()),
+    ]
+    parts: list[str | BinaryContent] = ["\n".join(text)]
+    for camera in CAMERAS:
+        frame = int(recorded["cameras"][camera]["frame"])
+        image = (
+            trace_path.parent / "frames" / camera / f"{frame:06d}.jpg"
+        ).read_bytes()
+        parts.extend(
+            [
+                f"camera '{camera}' (recorded step {turn}):",
+                BinaryContent(data=image, media_type="image/jpeg"),
+            ]
+        )
+    return parts
+
+
+def _feedback(
+    name: str,
+    parts: list[str | BinaryContent],
+    feedback: str,
+    turn: int,
+    turns: int,
+) -> ToolResult:
     payload = {
         "status": "executed",
-        "observation": f"Recorded RGB replay after action {turn}; choose another move_eef.",
+        "feedback": feedback,
+        "observation": "\n".join(part for part in parts if isinstance(part, str)),
         "_finish": turn == turns,
     }
     result = ToolResult(name, payload)
-    result.content_blocks = [
-        {"type": "text", "text": json.dumps(payload)},
-        *(
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": base64.b64encode(frames[camera]).decode("ascii"),
-                },
-            }
-            for camera in CAMERAS
-        ),
-    ]
+    result.content_blocks = [{"type": "text", "text": feedback}]
+    for part in parts:
+        if isinstance(part, str):
+            result.content_blocks.append({"type": "text", "text": part})
+        else:
+            result.content_blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64.b64encode(part.data).decode("ascii"),
+                    },
+                }
+            )
     return result
 
 
@@ -88,10 +125,6 @@ def run_task(source: Path, output: Path, key: str, task: str, turns: int) -> dic
     output.mkdir(parents=True)
     schema = output / "tools.json"
     schema.write_text(json.dumps([move]), encoding="utf-8")
-    frames = {
-        camera: next((trace_path.parent / "frames" / camera).glob("*.jpg")).read_bytes()
-        for camera in CAMERAS
-    }
     agent = EmbodiedAgent(
         mcp_servers=[
             McpServer(
@@ -119,18 +152,12 @@ def run_task(source: Path, output: Path, key: str, task: str, turns: int) -> dic
         planner_timeout_s=1200,
         reasoning_effort="medium",
     )
-    initial: list[str | BinaryContent] = ["Initial recorded robot observation:"]
-    for camera in CAMERAS:
-        initial.extend(
-            [
-                f"camera '{camera}':",
-                BinaryContent(data=frames[camera], media_type="image/jpeg"),
-            ]
-        )
+    initial = _recorded_parts(trace_path, trace, 0)
     with agent.start_episode(
-        prompt["goal"] + f" For this cache preflight, call move_eef {turns} times.",
+        prompt["goal"]
+        + " For this cache preflight, keep using move_eef until the environment ends.",
         system_prompt=prompt["system"]
-        + f"\nFor this cache preflight, use move_eef for {turns} turns before stopping.",
+        + "\nFor this recorded replay, use move_eef until the environment ends.",
         initial_context=initial,
         deferred_tools=["move_eef"],
     ) as episode:
@@ -140,7 +167,27 @@ def run_task(source: Path, output: Path, key: str, task: str, turns: int) -> dic
                 raise RuntimeError(f"{task}: model ended before action {turn}")
             if call.name != "move_eef":
                 raise RuntimeError(f"{task}: unexpected tool {call.name}")
-            episode.complete(call, _feedback(call.name, frames, turn, turns))
+            reference_turn = trace["turns"][min(turn - 1, len(trace["turns"]) - 1)]
+            feedback = next(
+                (
+                    record["tool_result"]
+                    for record in reversed(reference_turn.get("llm_calls") or [])
+                    if record.get("tool") == "move_eef"
+                    and record.get("accepted")
+                    and isinstance(record.get("tool_result"), str)
+                ),
+                "Accepted recorded move_eef action.",
+            )
+            episode.complete(
+                call,
+                _feedback(
+                    call.name,
+                    _recorded_parts(trace_path, trace, turn),
+                    feedback,
+                    turn,
+                    turns,
+                ),
+            )
         result = episode.wait(timeout=120)
     usage = result.stats["llm_usage"]
     if result.error or int(usage["requests"]) < turns:
