@@ -251,12 +251,13 @@ class EmbodiedEefPolicy(EefAgentPolicy):
                         return self._give_up_chunk(
                             "three invalid move_eef calls", observation
                         )
-                self._episode.complete(
-                    call,
-                    ToolResult(
-                        call.name, {"status": "rejected", "reason": outcome.tool_result}
-                    ),
+                rejected = ToolResult(
+                    call.name, {"status": "rejected", "reason": outcome.tool_result}
                 )
+                rejected.content_blocks = [
+                    {"type": "text", "text": outcome.tool_result}
+                ]
+                self._episode.complete(call, rejected)
                 continue
             if name in {"give_up", "done"}:
                 self._episode.complete(
