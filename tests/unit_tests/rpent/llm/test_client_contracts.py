@@ -210,6 +210,22 @@ def test_http_failures_have_bounded_retries_and_sanitized_logs(
     assert all(record["status_code"] == status for record in records)
     assert "private text" not in log_path.read_text()
     assert "secret-key" not in log_path.read_text()
+    request_records = [
+        json.loads(line)
+        for line in (tmp_path / "llm_requests.jsonl").read_text().splitlines()
+    ]
+    assert len(request_records) == expected_attempts
+    assert {record["request_id"] for record in request_records} == {
+        request_records[0]["request_id"]
+    }
+    assert [record["attempt"] for record in request_records] == list(
+        range(1, expected_attempts + 1)
+    )
+    assert all(record["status_code"] == status for record in request_records)
+    assert all(record["request_shape"]["text_chars"] > 0 for record in request_records)
+    request_log = (tmp_path / "llm_requests.jsonl").read_text()
+    assert "private text" not in request_log
+    assert "secret-key" not in request_log
 
 
 def test_transient_failure_recovers_without_replaying_completed_request(
@@ -243,6 +259,51 @@ def test_transient_failure_recovers_without_replaying_completed_request(
     assert result.text == "recovered"
     assert result.usage.requests == 1
     assert len(log_path.read_text().splitlines()) == 1
+    request_records = [
+        json.loads(line)
+        for line in (tmp_path / "llm_requests.jsonl").read_text().splitlines()
+    ]
+    assert [record["outcome"] for record in request_records] == ["error", "success"]
+    assert request_records[1]["usage"]["input_tokens"] == 4
+    assert request_records[1]["usage"]["output_tokens"] == 2
+
+
+def test_failed_multimodal_request_logs_only_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        raise ModelHTTPError(500, "offline", body={"prompt": "private text"})
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+    client = LLMClient(
+        LLMConfig(
+            "openai",
+            "offline",
+            api_key="secret-key",
+            retry=RetryPolicy(max_retries=0),
+        ),
+        log_path=tmp_path / "llm_errors.jsonl",
+    )
+    with pytest.raises(ModelHTTPError):
+        client._agent("private instruction", 128).run_sync(
+            [
+                "private text",
+                BinaryContent(data=b"jpeg-secret", media_type="image/jpeg"),
+            ]
+        )
+    record = json.loads((tmp_path / "llm_requests.jsonl").read_text().splitlines()[0])
+    assert record["status_code"] == 500
+    assert record["request_shape"]["image_count"] == 1
+    assert record["request_shape"]["image_bytes"] == len(b"jpeg-secret")
+    assert record["request_shape"]["text_chars"] >= len("private text") + len(
+        "private instruction"
+    )
+    assert record["request_shape"]["max_output_tokens"] == 128
+    log = (tmp_path / "llm_requests.jsonl").read_text()
+    assert "private text" not in log
+    assert "private instruction" not in log
+    assert "jpeg-secret" not in log
+    assert "secret-key" not in log
 
 
 @pytest.mark.parametrize(
