@@ -142,7 +142,7 @@ def run_task(source: Path, output: Path, key: str, task: str, turns: int) -> dic
             api_key=key,
             base_url="https://tokenhub.sensetime.com/v1",
             openai_format="responses",
-            prompt_cache_key="rpent-robodojo-eef-v1",
+            prompt_cache_key="roboprobe-l3-inspect-astra-v1",
             prompt_cache_mode="explicit",
             image_history_groups=2,
             parallel_tool_calls=False,

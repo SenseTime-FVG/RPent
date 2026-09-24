@@ -161,7 +161,7 @@ class EmbodiedEefPolicy(EefAgentPolicy):
                 base_url=self._env.get("L3_INSPECT_BASE_URL"),
                 openai_format="responses",
                 prompt_cache_key=self._env.get(
-                    "L3_INSPECT_PROMPT_CACHE_KEY", "rpent-robodojo-eef-v1"
+                    "L3_INSPECT_PROMPT_CACHE_KEY", "roboprobe-l3-inspect-astra-v1"
                 ),
                 prompt_cache_mode="explicit",
                 image_history_groups=2,
