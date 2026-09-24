@@ -33,6 +33,7 @@ from rpent.context import ContextDocument, assemble_context, load_skill
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.llm import LLMConfig, LLMUsage
 from rpent.planner.base import PlannerResult, build_planner
+from rpent.runtime import RuntimeConfig
 from rpent.session import EnvState
 from rpent.tools.toolkit import ToolResult
 from rpent.utils.logging import get_logger
@@ -290,6 +291,8 @@ class EmbodiedAgent:
 
     Construct once per evaluation configuration, then call :meth:`run` for
     each episode. The benchmark owns reset, success checks, and scoring.
+    ``runtime`` optionally configures isolated delegates for the API planner;
+    it requires the ``runtime`` installation extra.
     """
 
     mcp_servers: Sequence[McpServer]
@@ -302,6 +305,7 @@ class EmbodiedAgent:
     max_tokens: int = 8192
     planner_timeout_s: int | None = None
     reasoning_effort: str = "none"
+    runtime: RuntimeConfig | None = None
     _run_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -337,6 +341,8 @@ class EmbodiedAgent:
         """
         if self.planner not in {"api", "claude_code", "codex"}:
             raise ValueError(f"unsupported embodied planner: {self.planner}")
+        if self.runtime is not None and self.planner != "api":
+            raise ValueError("runtime is supported only by the api planner")
         if self.llm is not None and self.planner != "api":
             raise ValueError("llm is supported only by the api planner")
         if initial_context and self.planner != "api":
@@ -380,6 +386,7 @@ class EmbodiedAgent:
                 planner_timeout_s=self.planner_timeout_s,
                 reasoning_effort=self.reasoning_effort,
                 dashboard_events=NullDashboardEventSink(),
+                runtime=self.runtime,
             )
             result = planner.solve(
                 system_prompt=context.system_prompt,

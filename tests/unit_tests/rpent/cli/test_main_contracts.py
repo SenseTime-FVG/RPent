@@ -146,6 +146,33 @@ def test_shared_cli_defaults_reach_robot_config_parser(
     assert args.memory_profile == "hf"
 
 
+def test_runtime_config_reaches_cli_robot_setup(tmp_path, monkeypatch):
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        "subagents:\n  reader:\n    instructions: Analyze the scene.\n",
+        encoding="utf-8",
+    )
+    _, args = _capture_validated_args(
+        monkeypatch, ["--robot", "libero", "--runtime-config", str(path)]
+    )
+    assert args.agent_runtime.subagents["reader"].instructions == "Analyze the scene."
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude_code", "flash"])
+def test_runtime_config_rejected_for_other_cli_planners(
+    tmp_path, monkeypatch, capsys, backend
+):
+    path = tmp_path / "runtime.yaml"
+    path.write_text("subagents: {}", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        _capture_validated_args(
+            monkeypatch,
+            ["--robot", "libero", "--planner", backend, "--runtime-config", str(path)],
+        )
+    assert exc.value.code == 2
+    assert "--runtime-config requires --planner=api" in capsys.readouterr().err
+
+
 def test_deprecated_env_alias_routes_to_the_same_robot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -511,6 +538,7 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
 
     def build_planner(*args: Any, **kwargs: Any) -> ScriptedPlanner:
         calls["build_planner"] = (args, kwargs)
+        calls.setdefault("planner_runtimes", []).append(kwargs.get("runtime"))
         return planner
 
     def get_toolkit(*args: Any, **kwargs: Any) -> FakeToolkit:
@@ -529,6 +557,11 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
     monkeypatch.setattr(cli, "start_interactive_reader", lambda *a, **kw: None)
     monkeypatch.setattr(
         cli, "start_first_prompt_resolver", lambda queue: lambda: "operator-edited task"
+    )
+    runtime_path = tmp_path / "runtime.yaml"
+    runtime_path.write_text(
+        "subagents:\n  reviewer:\n    instructions: Review the plan.\n",
+        encoding="utf-8",
     )
     monkeypatch.setattr(
         sys,
@@ -549,6 +582,8 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
             "4",
             "--explore-sessions",
             str(sessions),
+            "--runtime-config",
+            str(runtime_path),
             *(["--interactive"] if interactive else []),
         ],
     )
@@ -568,6 +603,11 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
     if interactive:
         assert first_call["input_queue"] is not None
     assert len(calls["solve_calls"]) == sessions
+    assert len(calls["planner_runtimes"]) == sessions
+    assert all(
+        config.subagents["reviewer"].instructions == "Review the plan."
+        for config in calls["planner_runtimes"]
+    )
     if sessions == 2:
         assert calls["solve"]["system_prompt"] == "simulated system prompt\n"
         assert calls["solve"]["user_message"].startswith("You are agent 2 of up to 2")

@@ -186,6 +186,11 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
     merge_calls: list[dict[str, Any]] = []
     solved_calls = []
     planner_calls: list[dict[str, Any]] = []
+    from rpent.runtime import RuntimeConfig, SubAgentConfig
+
+    configured_runtime = RuntimeConfig(
+        subagents={"reviewer": SubAgentConfig(instructions="Review the plan.")}
+    )
 
     class FakeMemoryManager:
         def merge_memory(self, **kwargs: Any) -> dict[str, int]:
@@ -262,6 +267,7 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
     )
     args = SimpleNamespace(
         verbose=False,
+        agent_runtime=configured_runtime,
         robot_name="custom_exploration_env",
         explore=True,
         auto_merge_memory=True,
@@ -285,9 +291,12 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
     monkeypatch.setattr(
         dashboard_cli, "get_toolkit", lambda *args, **kwargs: FakeToolkit()
     )
-    monkeypatch.setattr(
-        dashboard_cli, "build_planner", lambda *args, **kwargs: FakePlanner()
-    )
+
+    def build_planner(*args, **kwargs):
+        assert kwargs["runtime"] == configured_runtime
+        return FakePlanner()
+
+    monkeypatch.setattr(dashboard_cli, "build_planner", build_planner)
 
     error = dashboard_cli._run_dashboard_task(
         args=args,

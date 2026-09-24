@@ -112,6 +112,36 @@ memory 访问与合并规则保持不变。
 和观测统一通过 ``rpent.context.assemble_context`` 组装，CLI 和 Dashboard
 也使用这个函数。直接使用结构化结果的方法见 :ref:`planner-context`。
 
+配置子 agent
+------------
+
+安装 ``pip install -e ".[runtime]"`` 后，可以向 ``api`` agent 传入
+``RuntimeConfig``。现有 ``run`` 参数仍用于配置主 agent：
+
+.. code-block:: python
+
+   from rpent.runtime import RuntimeConfig, SubAgentConfig
+
+   agent = EmbodiedAgent(
+       mcp_servers=[McpServer(name="robot", url="http://127.0.0.1:8000/mcp")],
+       output_dir="runs/episode-001",
+       llm=LLMConfig(provider="openai", model="gpt-5.5"),
+       runtime=RuntimeConfig(subagents={
+           "plan_reviewer": SubAgentConfig(
+               description="检查拟执行的机器人计划。",
+               instructions="指出给定计划中遗漏的必要前提。",
+               tools=(),
+           ),
+       }),
+   )
+
+也可使用 ``runtime=RuntimeConfig.from_file("benchmark/runtime.yaml")``。
+Python 配置中的 skill 路径按调用方工作目录解析；文件配置中的路径相对于配置
+文件解析。子 agent 接收显式委派的任务文本，不自动接收父级会话或初始观测。
+远程 MCP 动作工具由主 agent 使用；子 agent 只能选择实际存在于工具目录中的
+现有 artifact／文本读取工具。工具限制、模型选择、共享 usage 和 CLI/Dashboard
+用法见 :ref:`planner-runtime`。其他 planner 会在连接 MCP 之前拒绝 ``runtime``。
+
 RoboDojo 示例
 -------------
 

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from pydantic_ai.models import Model
 
     from rpent.llm import LLMConfig
+    from rpent.runtime import RuntimeConfig
 
 #: MCP namespace prefix for RPent tools (``mcp__<server>__<tool>``).
 #: Toolkits expose plain tool names; planners add/strip this prefix.
@@ -182,11 +183,14 @@ def build_planner(
     claude_code_max_budget_usd: float | None = None,
     dashboard_events: DashboardEventSink,
     no_images: bool = False,
+    runtime: RuntimeConfig | None = None,
 ):
     """Build a planner for the given backend, resolving credentials from env vars."""
     # Imports are deferred to avoid a circular import: api_loop / claude_code /
     # codex all import from this module (PlannerResult).
 
+    if runtime is not None and planner_type != "api":
+        raise ValueError("runtime is supported only by the api planner")
     if llm_config is not None and planner_type != "api":
         raise ValueError("llm_config is supported only by the api planner")
     if llm_config is not None and (model is not None or base_url is not None):
@@ -220,6 +224,7 @@ def build_planner(
             image_history_groups=(
                 llm_config.image_history_groups if llm_config is not None else None
             ),
+            runtime=runtime,
         )
     if planner_type == "claude_code":
         from rpent.planner.claude_code import ClaudeCodePlanner

@@ -153,6 +153,11 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument("--max-turns", type=int, default=100)
+    ap.add_argument(
+        "--runtime-config",
+        default=None,
+        help="YAML/JSON sub-agent configuration for the api planner; requires the runtime extra.",
+    )
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument(
         "--reasoning-effort",
@@ -308,6 +313,7 @@ def _start_continuation_session(
         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
         dashboard_events=dashboard_events,
         no_images=args.no_images,
+        runtime=getattr(args, "agent_runtime", None),
     )
     system_prompt = prompt_bundle.render(
         "system",
@@ -357,6 +363,16 @@ def main() -> int:
     )
     args = parser.parse_args()
     args.robot_name = early.robot_name
+    args.agent_runtime = None
+    if args.runtime_config is not None:
+        if args.planner != "api":
+            parser.error("--runtime-config requires --planner=api")
+        from rpent.runtime import RuntimeConfig
+
+        try:
+            args.agent_runtime = RuntimeConfig.from_file(args.runtime_config)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     human_interactive_exploration = (
         args.explore and robot_spec.supports_human_interactive_exploration
     )
@@ -457,6 +473,7 @@ def main() -> int:
         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
         dashboard_events=dashboard_events,
         no_images=args.no_images,
+        runtime=args.agent_runtime,
     )
     prompt_bundle = robot_spec.prompts
     prompt_vars = {**prompt_vars, "output_dir": output_dir}

@@ -57,7 +57,11 @@ Documentation = "https://rpent.readthedocs.io/en/latest/"
 "Bug Report" = "https://github.com/RLinf/RPent/issues"
 
 [project.optional-dependencies]
+runtime = [
+    "pydantic-ai-harness>=0.34,<0.35",
+]
 test = [
+    "rpent[runtime]",
     "coverage",
     "pytest",
     "pytest-timeout",

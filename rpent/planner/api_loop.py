@@ -32,7 +32,7 @@ from collections import deque
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent, BinaryContent, ModelSettings, Tool, ToolReturn
 from pydantic_ai.capabilities import ProcessHistory, Thinking
@@ -64,6 +64,9 @@ from rpent.planner.base import REASONING_EFFORTS, PlannerResult
 from rpent.session import EnvState
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from rpent.runtime import RuntimeConfig
 
 logger = get_logger("api_loop")
 
@@ -100,6 +103,7 @@ class ApiAgentLoop:
         timeout_s: int | None = None,
         cache_breakpoints: bool = False,
         image_history_groups: int | None = None,
+        runtime: RuntimeConfig | None = None,
     ):
         """Store the pydantic-ai model and the output-token cap."""
         self._model = model
@@ -109,6 +113,7 @@ class ApiAgentLoop:
         self._timeout_s = timeout_s
         self._cache_breakpoints = cache_breakpoints
         self._image_history_groups = image_history_groups
+        self._runtime = runtime
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         self._reasoning_effort = reasoning_effort
@@ -237,6 +242,7 @@ class ApiAgentLoop:
                 else user_message
             )
         history: list[ModelMessage] | None = None
+        run: Any | None = None
         try:
             while True:
                 run_turns = 0
@@ -307,6 +313,9 @@ class ApiAgentLoop:
         except Exception as e:  # noqa: BLE001 - surfaced via PlannerResult.error
             last_error = _api_error_text(e, no_images=self._no_images)
             logger.error("agent run failed: %s", last_error)
+        finally:
+            if run is not None:
+                usage = run.usage
 
         return PlannerResult(
             finish_result=observer.finish_result,
@@ -396,18 +405,21 @@ class ApiAgentLoop:
 
     def _build_agent(self, system_prompt: str, toolkit: Toolkit) -> Agent:
         """Build an Agent for terminal or Dashboard execution."""
+        from rpent.runtime.factory import build_runtime_agent
+
         thinking_effort: str | bool = self._reasoning_effort
         if thinking_effort == "none":
             thinking_effort = False
-        return Agent(
-            self._model,
-            instructions=system_prompt or None,
+        return build_runtime_agent(
+            model=self._model,
+            system_prompt=system_prompt,
             tools=_build_tools(
                 toolkit,
                 no_images=self._no_images,
                 cache_breakpoints=self._cache_breakpoints,
             ),
-            model_settings=_build_model_settings(self._model, self._max_tokens),
+            max_tokens=self._max_tokens,
+            runtime=self._runtime,
             capabilities=[
                 Thinking(effort=thinking_effort),
                 ProcessHistory(

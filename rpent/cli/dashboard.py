@@ -278,6 +278,7 @@ def _run_dashboard_task(
                         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
                         dashboard_events=state,
                         no_images=args.no_images,
+                        runtime=getattr(args, "agent_runtime", None),
                     )
                     context = assemble_context(
                         prompt=system_prompt, query=session_message

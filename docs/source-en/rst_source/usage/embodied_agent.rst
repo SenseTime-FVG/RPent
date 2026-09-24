@@ -128,6 +128,39 @@ not accept this argument. Skills, memory, and observations use the same
 ``rpent.context.assemble_context`` function as CLI and Dashboard runs; see
 :ref:`planner-context` for direct use of the structured bundle.
 
+Configured delegates
+--------------------
+
+Install ``pip install -e ".[runtime]"`` and pass a ``RuntimeConfig`` to the
+``api`` agent. The existing ``run`` arguments continue to describe the parent:
+
+.. code-block:: python
+
+   from rpent.runtime import RuntimeConfig, SubAgentConfig
+
+   agent = EmbodiedAgent(
+       mcp_servers=[McpServer(name="robot", url="http://127.0.0.1:8000/mcp")],
+       output_dir="runs/episode-001",
+       llm=LLMConfig(provider="openai", model="gpt-5.5"),
+       runtime=RuntimeConfig(subagents={
+           "plan_reviewer": SubAgentConfig(
+               description="Check a proposed robot plan.",
+               instructions="Identify missing prerequisites in the supplied plan.",
+               tools=(),
+           ),
+       }),
+   )
+
+Alternatively, use ``runtime=RuntimeConfig.from_file("benchmark/runtime.yaml")``.
+Skill paths in Python configuration follow the caller's working directory; file
+configuration resolves them relative to that file. Children receive explicit
+delegation text rather than the parent's conversation or initial observations.
+Remote MCP action tools remain on the parent. Only the existing artifact/text
+readers can be selected for children, and a reader must exist in the supplied
+catalog. See :ref:`planner-runtime` for tool restrictions, model selection,
+shared usage, and CLI/Dashboard configuration. Other planners reject ``runtime``
+before opening MCP connections.
+
 RoboDojo example
 ----------------
 

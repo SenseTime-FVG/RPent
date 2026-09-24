@@ -29,6 +29,7 @@ from rpent.embodied_agent import EmbodiedAgent, McpServer
 from rpent.llm import LLMConfig
 from rpent.planner.base import PlannerResult
 from rpent.planner.utils.http_mcp_server import HttpMcpServer
+from rpent.runtime import RuntimeConfig, SubAgentConfig
 from rpent.tools.toolkit import ToolResult
 
 
@@ -61,6 +62,89 @@ class _RobotTools:
                 return ToolResult(name=name, result={"error": "pose unreachable"})
             return ToolResult(name=name, result={"pose": input_dict["pose"]})
         return ToolResult(name=name, result={"camera": "front", "_image_bytes": b"png"})
+
+
+def test_embodied_runtime_delegates_before_executing_robot_tool(tmp_path, monkeypatch):
+    from pydantic_ai.messages import (
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+    )
+    from pydantic_ai.models.function import FunctionModel
+
+    from rpent.planner import base
+
+    def model(messages, info):
+        if info.instructions == "CHILD":
+            assert info.function_tools == []
+            return ModelResponse(parts=[TextPart("target")])
+        returned = [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        if not returned:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "delegate_task",
+                        {"agent_name": "reviewer", "task": "Choose a pose"},
+                        "d",
+                    )
+                ]
+            )
+        if len(returned) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "robot__move_eef", {"pose": returned[0].content}, "move"
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "finish", {"status": "success", "summary": "placed"}, "finish"
+                )
+            ]
+        )
+
+    monkeypatch.setattr(base, "build_api_model", lambda *a, **kw: FunctionModel(model))
+    robot = _RobotTools()
+    server = HttpMcpServer(robot)
+    server.start()
+    try:
+        agent = EmbodiedAgent(
+            mcp_servers=[McpServer(name="robot", url=server.url)],
+            output_dir=tmp_path / "episode",
+            model="openai:offline",
+            runtime=RuntimeConfig(
+                subagents={"reviewer": SubAgentConfig(instructions="CHILD")}
+            ),
+        )
+        result = agent.run("Place the block", system_prompt="ROOT")
+    finally:
+        server.stop()
+    assert result.error is None
+    assert result.finish_result["status"] == "success"
+    assert result.stats["requests"] == 4
+    assert robot.calls == [("move_eef", {"pose": "target"})]
+
+
+@pytest.mark.parametrize("planner", ["codex", "claude_code"])
+def test_embodied_runtime_rejected_before_mcp_or_output_creation(tmp_path, planner):
+    output = tmp_path / "unused"
+    agent = EmbodiedAgent(
+        mcp_servers=[McpServer(name="robot", url="http://127.0.0.1:1/mcp")],
+        output_dir=output,
+        planner=planner,
+        runtime=RuntimeConfig(),
+    )
+    with pytest.raises(ValueError, match="runtime.*api"):
+        agent.run("Task", system_prompt="Instructions")
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("with_context", [False, True])

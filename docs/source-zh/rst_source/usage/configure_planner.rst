@@ -75,6 +75,63 @@ SDK。
 - ``--no-images`` —— 不向模型发送图片字节；纯文本模型必须加此参数。此时
   智能体只依赖文本状态推理，任务表现可能不够理想。
 
+.. _planner-runtime:
+
+配置子 agent
+~~~~~~~~~~~~
+
+安装可选的 ``runtime`` 依赖后，``api`` planner 可以把分析任务委派给指定的
+PydanticAI agent，继续使用现有执行循环：
+
+.. code-block:: bash
+
+   pip install -e ".[runtime]"
+   rpent --robot libero --planner api --model openai:gpt-5.5 \
+     --runtime-config benchmark/runtime.yaml --suite libero_goal_task --task 1
+
+配置支持 YAML 和 JSON，例如：
+
+.. code-block:: yaml
+
+   subagents:
+     scene_analyst:
+       description: 分析已记录的观测。
+       instructions: 根据指定 step 的观测，报告可见事实和不确定项。
+       skills: [skills/scene-analysis/SKILL.md]
+       tools: [read_image]
+     plan_reviewer:
+       description: 检查拟执行的动作计划。
+       instructions: 检查给定计划是否遗漏必要前提。
+       tools: []
+
+运行前需创建引用的 skill 文件。``skills`` 路径相对于配置文件所在目录解析，
+每次 planner 会话都会重新读取。只加载显式声明的 agent，不自动发现项目或
+用户目录中的 agent 定义。省略 ``--runtime-config`` 时保持单 agent 行为；
+其他 planner 会拒绝这个参数。
+
+主 agent 获得 ``delegate_task(agent_name, task)`` 工具。每次调用都会创建独立
+的子会话，并返回文本结果。委派任务必须提供完整信息：父级的 query、memory
+片段、初始图片和会话历史不会自动复制。子 agent 只能使用显式列出且实际存在于
+父级工具目录中的 ``read_image``、``read_text_file``、``list_dir``，继续遵守
+现有读取权限。``read_image`` 读取已记录的 step artifact；只传文本路径不会
+把图片发送给子 agent。机器人动作和 ``finish`` 由主 agent 调用。
+
+省略 ``model`` 时，子 agent 继承主 agent 已配置的模型、端点和重试策略。
+显式指定带提供商前缀的 ``model`` 时，使用该提供商的环境凭据和端点，不继承
+父级显式传入的 ``--base-url`` 或 ``LLMConfig.api_key``。输出 token 上限、
+thinking 设置和历史图片处理方式继承自 planner。
+
+独立的子 agent 模型调用可以并行，共享 RPent 工具集的调用仍串行执行；委派工具
+本身不占用工具执行槽。子 agent 共享父级 usage 和请求限制：现有 SDK 的
+``max_turns + 1`` 请求阈值计入本次运行中父子 agent 的请求。SDK 在发起请求前
+检查已记录的 usage；并行处理中尚未计入的请求可能使最终次数超过该阈值。Token 和请求数
+统计包含子 agent；``turns_used`` 和 ``tool_calls`` 仍描述父级循环。Transcript
+记录父级的委派调用及其结果，不保存完整子会话。现有 planner 中断和超时机制
+也适用于委派任务。
+
+此 extra 使用 ``pydantic-ai-harness>=0.34,<0.35``，其核心依赖要求
+``pydantic-ai-slim>=2.44.0``。基础单 agent 安装不要求 harness 包。
+
 .. _planner-claude-code:
 
 ``claude_code`` planner

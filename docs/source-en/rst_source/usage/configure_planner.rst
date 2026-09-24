@@ -85,6 +85,71 @@ Relevant ``api`` planner knobs:
   text-only models. The agent then reasons from textual state alone,
   so task performance may not be satisfactory.
 
+.. _planner-runtime:
+
+Configured sub-agents
+~~~~~~~~~~~~~~~~~~~~~
+
+The optional ``runtime`` extra lets the ``api`` planner delegate analysis to
+named PydanticAI agents while retaining its existing execution loop:
+
+.. code-block:: bash
+
+   pip install -e ".[runtime]"
+   rpent --robot libero --planner api --model openai:gpt-5.5 \
+     --runtime-config benchmark/runtime.yaml --suite libero_goal_task --task 1
+
+The configuration accepts YAML or JSON. For example:
+
+.. code-block:: yaml
+
+   subagents:
+     scene_analyst:
+       description: Analyze recorded observations.
+       instructions: Report visible facts and uncertainties from the specified step.
+       skills: [skills/scene-analysis/SKILL.md]
+       tools: [read_image]
+     plan_reviewer:
+       description: Review a proposed action plan.
+       instructions: Check the supplied plan for missing prerequisites.
+       tools: []
+
+Create the referenced skill files before running. Paths in ``skills`` are
+relative to the configuration file. Each planner session reads them afresh.
+Only the declared agents are loaded; project and home-directory agent definitions
+are not discovered. Omit ``--runtime-config`` to keep the single-agent behavior.
+Other planners reject this option.
+
+The parent receives ``delegate_task(agent_name, task)``. Each call starts a fresh
+child conversation and returns its text result. The task must be self-contained:
+the parent's query, memory excerpts, initial images, and conversation history are
+not copied. Children may use only explicitly listed ``read_image``,
+``read_text_file``, and ``list_dir`` tools present in the parent's catalog.
+Existing reader permissions remain in force. ``read_image`` reads recorded step
+artifacts; a text path alone does not transfer an image to a child. Robot actions
+and ``finish`` remain with the parent.
+
+An omitted ``model`` inherits the parent's configured model, endpoint, and retry
+policy. An explicit provider-prefixed ``model`` uses the selected provider's
+environment credentials and endpoint; it does not inherit an explicit parent
+``--base-url`` or ``LLMConfig.api_key``. Output-token limits, thinking settings,
+and history-image handling are inherited from the planner.
+
+Independent child model calls can run concurrently. Calls through the shared
+RPent toolset remain serial, and delegation itself does not occupy its tool slot.
+Children share the parent's usage and request limit: the existing SDK threshold
+of ``max_turns + 1`` counts parent and child requests within that run. The SDK
+checks recorded usage before a request; concurrent in-flight requests can cause
+the final request count to exceed that threshold.
+Token/request statistics include delegates; ``turns_used`` and ``tool_calls``
+continue to describe the parent loop. The transcript shows parent delegation
+calls and their returned results, not complete child conversations. Existing
+planner interruption and timeout behavior also applies to delegated work.
+
+This extra selects ``pydantic-ai-harness>=0.34,<0.35``, whose core dependency is
+``pydantic-ai-slim>=2.44.0``. The base single-agent installation does not require
+the harness package.
+
 .. _planner-claude-code:
 
 The ``claude_code`` planner
