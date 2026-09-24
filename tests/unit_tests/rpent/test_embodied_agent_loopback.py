@@ -151,7 +151,10 @@ def test_episode_hands_motion_to_benchmark_and_returns_observation(
     def model(messages: list[Any], info: Any) -> ModelResponse:
         nonlocal requests
         requests += 1
-        assert info.function_tools
+        assert {tool.name for tool in info.function_tools} == {
+            "move_eef",
+            "snapshot",
+        }
         if requests == 2:
             assert "executed" in str(messages)
             assert "BinaryContent" in str(messages)
