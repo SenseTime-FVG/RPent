@@ -39,7 +39,11 @@ from pydantic_ai.usage import RequestUsage, RunUsage
 
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.llm import LLMClient, LLMConfig, LLMUsage, RetryPolicy
-from rpent.llm.client import _mark_recent_function_outputs, build_model_settings
+from rpent.llm.client import (
+    _mark_recent_function_outputs,
+    _mark_text_before_images,
+    build_model_settings,
+)
 from rpent.llm.retry import RetryLoggingModel
 from rpent.planner.api_loop import _build_stats, _prune_history_images
 from rpent.planner.base import build_planner
@@ -142,7 +146,7 @@ def test_responses_explicit_cache_settings_and_breakpoint_wire_format() -> None:
     ]
 
 
-def test_explicit_cache_keeps_breakpoint_when_old_image_ages_out() -> None:
+def test_explicit_cache_keeps_initial_breakpoint_when_old_image_ages_out() -> None:
     model = LLMConfig(
         "openai",
         "gpt-6-astra/azure_L/qwb",
@@ -205,6 +209,23 @@ def test_explicit_cache_keeps_breakpoint_when_old_image_ages_out() -> None:
     assert after[1]["content"][-1]["type"] == "input_text"
     assert after[2]["content"][-1]["type"] == "input_image"
     assert after[3]["content"][-1]["type"] == "input_image"
+
+
+def test_explicit_cache_prioritizes_tool_feedback_over_later_camera_labels() -> None:
+    wire = [
+        {"type": "function_call_output", "call_id": "move", "output": "robot state"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "latest camera:"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,YQ=="},
+            ],
+        },
+    ]
+    _mark_recent_function_outputs(wire)
+    _mark_text_before_images(wire)
+    assert wire[0]["output"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert "prompt_cache_breakpoint" not in wire[1]["content"][0]
 
 
 def test_prompt_cache_configuration_rejects_incompatible_endpoints() -> None:

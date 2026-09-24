@@ -56,12 +56,13 @@ def _mark_recent_function_outputs(input_items: list[dict[str, Any]]) -> None:
 
 
 def _mark_text_before_images(input_items: list[dict[str, Any]]) -> None:
-    """Cache the text prefix before each camera image or its later placeholder.
+    """Cache image labels only before the first tool result arrives.
 
-    Older observations are replaced with text as the image window advances.
-    Keep the marker on each label after replacement so the next request can
-    still match the prefix that ended immediately before the former image.
+    Later camera labels follow tool feedback. Marking all of them prevents the
+    provider from reusing the longer prefix cached at recent tool results.
     """
+    if any(item.get("type") == "function_call_output" for item in input_items):
+        return
     for item in input_items:
         if item.get("role") != "user" or not isinstance(item.get("content"), list):
             continue
