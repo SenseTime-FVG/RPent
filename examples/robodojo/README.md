@@ -36,6 +36,10 @@ and submit separate GPU shards, for example ``plan --jobs 16``. The manager
 keeps one native scored seed-0/layout-0 episode per task, and stores RPent
 usage and retry logs under each task trace's ``rpent`` directory. This
 54-task coverage run is distinct from RoboDojo's official multi-seed leaderboard.
+Each shard gets its own Warp, Torch, and CUDA compilation caches so parallel
+workers cannot read partially written kernels. The policy waits up to 2,100
+seconds for a tool call while model requests retry; set
+``L3_INSPECT_TOOL_CALL_TIMEOUT_S`` to override that limit.
 After scoring, run ``manage.py status`` and ``report_eef.py --experiment
 /path/to/new-experiment``. The report joins each native result to the same
 run's RPent request log and reports per-task calls, retries, tokens, and cache
