@@ -76,6 +76,29 @@ def configure(experiment: Path, repo: Path, key_file: Path, deps: Path) -> None:
         'export PYTHONPATH="${RP_ONCE_DEPS}:${WORKSPACE}',
         f'export PYTHONPATH="{deps}:{repo}:${{RP_ONCE_DEPS}}:${{WORKSPACE}}',
     )
+    # The source launcher shares its XDG cache between all workers. Warp can
+    # read a partially compiled module when several shards start together.
+    # Give each shard its own kernel cache while retaining shared dependencies.
+    cache_root = '${CACHE_ROOT}'
+    _replace(
+        worker,
+        'export XDG_CACHE_HOME="${RP_ONCE_CACHE_ROOT}/xdg/isaaclab232"',
+        'PLAN_DIR="${SHARD%/*}"\n'
+        'PLAN_NAME="${PLAN_DIR##*/}"\n'
+        'CACHE_ROOT="${EXPERIMENT}/runtime/worker-cache/${PLAN_NAME}/${SHARD##*/}"\n'
+        f'export XDG_CACHE_HOME="{cache_root}/xdg"\n'
+        f'export WARP_CACHE_PATH="{cache_root}/warp"',
+    )
+    _replace(
+        worker,
+        'export TORCH_EXTENSIONS_DIR="${RP_ONCE_CACHE_ROOT}/torch_extensions/${GPU_TAG}-isaaclab232"',
+        f'export TORCH_EXTENSIONS_DIR="{cache_root}/torch_extensions/${{GPU_TAG}}"',
+    )
+    _replace(
+        worker,
+        'export CUDA_CACHE_PATH="${RP_ONCE_CACHE_ROOT}/cuda_cache/driver${DRIVER_TAG}"',
+        f'export CUDA_CACHE_PATH="{cache_root}/cuda_cache/driver${{DRIVER_TAG}}"',
+    )
     _replace(
         worker,
         "from XPolicyLab.policy.RoboDojo_Agent_L3_Inspect_EEF.model import Model",
