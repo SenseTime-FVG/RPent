@@ -92,7 +92,7 @@ Files: paired runtime/trajectory usage pages, existing relevant guides, `example
 - [x] Run the offline example to produce a complete sample trace and export; include commands for real configured models without embedding credentials.
 - [x] Run pre-commit, complete CPU unit suite, both Sphinx builds, startup probes and focused browser verification.
 - [x] Independently review implementation and fix findings; preserve test evidence and unverified hardware limitations.
-- [ ] Fetch/integrate latest main again if changed, rerun affected checks, commit and push the topic branch. Verify the remote commit.
+- [x] Fetch/integrate latest main again if changed, rerun affected checks, commit and push the topic branch. Verify the remote commit.
 
 ## Execution record
 
@@ -108,4 +108,5 @@ Files: paired runtime/trajectory usage pages, existing relevant guides, `example
 - Final bilingual Sphinx builds both succeeded with warnings treated as errors. The final exported sample reports are `logs/runtime-report-final-20260924/index.html` and `logs/runtime-summary-report-final-20260924/index.html`; generated run/media/build files remain ignored and are not included in commits.
 - Final required checks on 2026-09-25: `pre-commit run --all-files` passed both Ruff hooks; `python -m pytest tests/unit_tests -v` passed **830 tests, with one skip**, in 94.91 seconds. The two warnings come from SDK deprecation of the test transport's `httpx.AsyncClient`; no test failed. The first formatting run normalized one pre-existing quote in `examples/robodojo/configure_eef_experiment.py`; the reviewed formatting-only change is included so repository-wide checks pass.
 - Final browser adapter check: `node --test tests/unit_tests/rpent/dashboard/test_trajectory_live.mjs` passed all three tests; both trajectory JavaScript files passed `node --check`. Final `git fetch origin main` and `git merge --no-edit origin/main` confirmed that `6464846` is already integrated.
+- Delivery: implementation commit `1723949` (`feat(runtime): add configurable context and trajectory tracing`) was pushed successfully to `origin/codex/pydantic-runtime`. The branch also contains preserved runtime commit `5072d4f` and main integration commit `2b8c844`. This documentation-only follow-up records the completed validation and delivery; it changes no tested implementation.
 - Full environment: `/tmp/rpent-runtime-full-20260924`, Python 3.11.15, PydanticAI 2.49.0, harness 0.34.0, Torch 2.7.1 CPU, LeRobot 0.3.3. Installed `.[test,flywheel]`, docs requirements, pre-commit 4.6.2 and imageio-ffmpeg. No live provider, GPU simulator, VLA checkpoint or physical robot was exercised; the Python 3.10/3.12 CI matrix remains unverified locally.
