@@ -41,7 +41,7 @@ from rpent.dashboard.events import NullDashboardEventSink
 from rpent.llm import LLMClient, LLMConfig, LLMUsage, RetryPolicy
 from rpent.llm.client import _mark_recent_function_outputs, build_model_settings
 from rpent.llm.retry import RetryLoggingModel
-from rpent.planner.api_loop import _build_stats
+from rpent.planner.api_loop import _build_stats, _prune_history_images
 from rpent.planner.base import build_planner
 
 
@@ -140,6 +140,71 @@ def test_responses_explicit_cache_settings_and_breakpoint_wire_format() -> None:
             "prompt_cache_breakpoint": {"mode": "explicit"},
         }
     ]
+
+
+def test_explicit_cache_keeps_breakpoint_when_old_image_ages_out() -> None:
+    model = LLMConfig(
+        "openai",
+        "gpt-6-astra/azure_L/qwb",
+        api_key="test",
+        prompt_cache_mode="explicit",
+        image_history_groups=2,
+    ).build_model()
+    settings = build_model_settings(model, 128)
+    messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=[
+                        "stable goal",
+                        CachePoint(),
+                        "demonstration camera:",
+                        BinaryContent(data=b"demonstration", media_type="image/jpeg"),
+                        "camera 0:",
+                        BinaryContent(data=b"frame-0", media_type="image/jpeg"),
+                    ]
+                )
+            ]
+        ),
+        *(
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=[
+                            f"camera {index}:",
+                            BinaryContent(
+                                data=f"frame-{index}".encode(),
+                                media_type="image/jpeg",
+                            ),
+                        ]
+                    )
+                ]
+            )
+            for index in range(1, 4)
+        ),
+    ]
+    _, before = asyncio.run(
+        model._map_messages(messages, settings, ModelRequestParameters())
+    )
+    pruned = _prune_history_images(
+        messages, max_groups=2, preserve_initial_image_count=1
+    )
+    _, after = asyncio.run(
+        model._map_messages(pruned, settings, ModelRequestParameters())
+    )
+
+    # The marker remains on each camera label when its image becomes a stub.
+    for index in range(4):
+        label_before = before[index]["content"][-2]
+        label_after = after[index]["content"][-2]
+        assert label_before == label_after
+        assert label_after["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert after[0]["content"][1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert after[0]["content"][2]["type"] == "input_image"
+    assert after[0]["content"][-1]["type"] == "input_text"
+    assert after[1]["content"][-1]["type"] == "input_text"
+    assert after[2]["content"][-1]["type"] == "input_image"
+    assert after[3]["content"][-1]["type"] == "input_image"
 
 
 def test_prompt_cache_configuration_rejects_incompatible_endpoints() -> None:

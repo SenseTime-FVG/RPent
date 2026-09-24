@@ -59,7 +59,7 @@ from rpent.dashboard.events import (
 )
 from rpent.dashboard.interaction import DashboardInteractionPort, DashboardMessage
 from rpent.dashboard.planner_control import DashboardPlannerControl
-from rpent.llm.client import build_model_settings
+from rpent.llm.client import OMITTED_HISTORY_IMAGE_TEXT, build_model_settings
 from rpent.planner.base import REASONING_EFFORTS, PlannerResult
 from rpent.session import EnvState
 from rpent.tools.toolkit import Toolkit
@@ -789,7 +789,7 @@ def _prune_history_images(
         message = new_messages[mi]
         part = message.parts[pi]
         new_content = [
-            "[earlier camera image omitted to bound request size]"
+            OMITTED_HISTORY_IMAGE_TEXT
             if ci in drop_items
             else item
             for ci, item in enumerate(part.content)
