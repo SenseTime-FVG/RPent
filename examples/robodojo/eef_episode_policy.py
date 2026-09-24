@@ -117,6 +117,14 @@ class EmbodiedEefPolicy(EefAgentPolicy):
         self._played = 0
         self._started_at: float | None = None
         self._artifact_dir = Path(kwargs["env"]["L3_INSPECT_TRACE_DIR"]) / "rpent"
+        # A single provider call may consume the SDK read timeout on each of
+        # three HTTP attempts. Keep the tool bridge open while those retries
+        # finish instead of treating a slow model response as a policy error.
+        self._tool_call_timeout_s = float(
+            kwargs["env"].get("L3_INSPECT_TOOL_CALL_TIMEOUT_S", "2100")
+        )
+        if self._tool_call_timeout_s <= 0:
+            raise ValueError("L3_INSPECT_TOOL_CALL_TIMEOUT_S must be positive")
         super().__init__(client=_UnusedClient(), **kwargs)
 
     def _start(self, observation: Observation) -> None:
@@ -208,7 +216,7 @@ class EmbodiedEefPolicy(EefAgentPolicy):
 
         repair_attempts = 0
         while True:
-            call = self._episode.next_call(timeout=300)
+            call = self._episode.next_call(timeout=self._tool_call_timeout_s)
             if call is None:
                 result = self._episode.wait(timeout=5)
                 return self._give_up_chunk(
