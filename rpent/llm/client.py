@@ -34,6 +34,7 @@ OpenAIFormat = Literal["responses", "chat"]
 PromptCacheMode = Literal["implicit", "explicit"]
 
 logger = get_logger("llm.client")
+OMITTED_HISTORY_IMAGE_TEXT = "[earlier camera image omitted to bound request size]"
 
 
 def _mark_recent_function_outputs(input_items: list[dict[str, Any]]) -> None:
@@ -52,6 +53,29 @@ def _mark_recent_function_outputs(input_items: list[dict[str, Any]]) -> None:
                 "prompt_cache_breakpoint": {"mode": "explicit"},
             }
         ]
+
+
+def _mark_text_before_images(input_items: list[dict[str, Any]]) -> None:
+    """Cache the text prefix before each camera image or its later placeholder.
+
+    Older observations are replaced with text as the image window advances.
+    Keep the marker on each label after replacement so the next request can
+    still match the prefix that ended immediately before the former image.
+    """
+    for item in input_items:
+        if item.get("role") != "user" or not isinstance(item.get("content"), list):
+            continue
+        content = item["content"]
+        for index in range(1, len(content)):
+            part = content[index]
+            if part.get("type") != "input_image" and not (
+                part.get("type") == "input_text"
+                and part.get("text") == OMITTED_HISTORY_IMAGE_TEXT
+            ):
+                continue
+            previous = content[index - 1]
+            if previous.get("type") == "input_text":
+                previous["prompt_cache_breakpoint"] = {"mode": "explicit"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +165,7 @@ class LLMConfig:
                         *args, **kwargs
                     )
                     _mark_recent_function_outputs(input_items)
+                    _mark_text_before_images(input_items)
                     return instructions, input_items
 
             model_cls = ExplicitCacheResponsesModel
