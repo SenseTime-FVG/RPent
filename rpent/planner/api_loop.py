@@ -347,11 +347,7 @@ class ApiAgentLoop:
             # A later request can fail after earlier responses succeeded in
             # this run. Preserve their token usage in the episode summary.
             if active_run is not None and not active_run_counted:
-                usage = (
-                    active_run.usage
-                    if usage is None
-                    else usage + active_run.usage
-                )
+                usage = active_run.usage if usage is None else usage + active_run.usage
             last_error = _api_error_text(e, no_images=self._no_images)
             logger.error("agent run failed: %s", last_error)
 
@@ -789,9 +785,7 @@ def _prune_history_images(
         message = new_messages[mi]
         part = message.parts[pi]
         new_content = [
-            OMITTED_HISTORY_IMAGE_TEXT
-            if ci in drop_items
-            else item
+            OMITTED_HISTORY_IMAGE_TEXT if ci in drop_items else item
             for ci, item in enumerate(part.content)
         ]
         new_parts = list(message.parts)
