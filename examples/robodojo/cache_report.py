@@ -18,6 +18,7 @@ from pathlib import Path
 def summarize(log_root: Path, run_prefix: str) -> dict[str, object]:
     totals = {
         "decisions": 0,
+        "incomplete_decisions": 0,
         "decisions_with_usage": 0,
         "model_requests": 0,
         "input_tokens": 0,
@@ -29,8 +30,14 @@ def summarize(log_root: Path, run_prefix: str) -> dict[str, object]:
     runs: set[str] = set()
     for path in log_root.glob(f"{run_prefix}*/episode_*/decision_*.json"):
         runs.add(path.parents[1].name)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, FileNotFoundError):
+            # RoboDawn writes decision logs in place while evaluations run.
+            # A subsequent report will include the file after it is complete.
+            totals["incomplete_decisions"] += 1
+            continue
         totals["decisions"] += 1
-        record = json.loads(path.read_text(encoding="utf-8"))
         usage = record.get("usage") or {}
         if not usage:
             continue

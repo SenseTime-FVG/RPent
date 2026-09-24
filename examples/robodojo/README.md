@@ -100,7 +100,9 @@ python RPent/examples/robodojo/cache_report.py \
 
 `cache_hit_rate` is `cached_input_tokens / input_tokens` for decisions with
 usage data. Failed requests without provider usage are excluded; the report
-shows their count as `decisions - decisions_with_usage`. Older adapter runs did
+shows their count as `decisions - decisions_with_usage`. During a live run,
+`incomplete_decisions` counts JSON files that were still being written and are
+excluded until the next report. Older adapter runs did
 not forward cache write tokens, so `cache_write_tokens_reported=false` means
 that figure cannot be recovered from those logs. The official OpenAI
 [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
