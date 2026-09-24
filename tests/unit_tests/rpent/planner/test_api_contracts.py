@@ -330,6 +330,39 @@ def test_backend_failure_is_returned_without_escaping() -> None:
     assert result.messages == [{"role": "user", "content": "complete the task"}]
 
 
+def test_backend_failure_retains_usage_from_earlier_response() -> None:
+    attempts = 0
+
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        nonlocal attempts
+        del messages, info
+        attempts += 1
+        if attempts == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "finish",
+                        {"status": "success", "summary": "too early"},
+                        "rejected-finish",
+                    )
+                ],
+                usage=RequestUsage(input_tokens=7, output_tokens=3),
+            )
+        raise ModelHTTPError(500, "provider failed")
+
+    result = solve_with_model(
+        model,
+        FakeToolkit({"error": "finish refused by environment"}),
+        RecordingSink(),
+    )
+
+    assert result.error is not None
+    assert "500" in result.error
+    assert result.stats["requests"] == 1
+    assert result.stats["total_input_tokens"] == 7
+    assert result.stats["total_output_tokens"] == 3
+
+
 def test_image_policy_error_is_not_misdiagnosed_as_text_only_model() -> None:
     error = ModelHTTPError(
         400,

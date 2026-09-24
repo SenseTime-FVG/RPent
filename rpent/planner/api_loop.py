@@ -244,11 +244,15 @@ class ApiAgentLoop:
                 else user_message
             )
         history: list[ModelMessage] | None = None
+        active_run: Any | None = None
+        active_run_counted = False
         try:
             while True:
                 run_turns = 0
                 ended_without_tool = False
                 last_response_tool_calls = 0
+                active_run = None
+                active_run_counted = False
                 # request_limit overrides pydantic-ai's default (50) so the
                 # manual max_turns break below is what bounds each run.
                 async with agent.iter(
@@ -256,6 +260,7 @@ class ApiAgentLoop:
                     message_history=history,
                     usage_limits=UsageLimits(request_limit=max_turns + 1),
                 ) as run:
+                    active_run = run
                     async for node in run:
                         if interactive and _inject_pending(run):
                             quit_requested = True
@@ -303,6 +308,7 @@ class ApiAgentLoop:
                             break
 
                     usage = run.usage if usage is None else usage + run.usage
+                    active_run_counted = True
                     if interactive or (self._require_tool_call and ended_without_tool):
                         history = run.all_messages()
 
@@ -338,6 +344,14 @@ class ApiAgentLoop:
         except UsageLimitExceeded as e:
             logger.info("usage limit reached: %s", e)
         except Exception as e:  # noqa: BLE001 - surfaced via PlannerResult.error
+            # A later request can fail after earlier responses succeeded in
+            # this run. Preserve their token usage in the episode summary.
+            if active_run is not None and not active_run_counted:
+                usage = (
+                    active_run.usage
+                    if usage is None
+                    else usage + active_run.usage
+                )
             last_error = _api_error_text(e, no_images=self._no_images)
             logger.error("agent run failed: %s", last_error)
 
