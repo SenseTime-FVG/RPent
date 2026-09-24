@@ -97,6 +97,7 @@ class EnvState:
 
     def __init__(self, output_dir: Path | str):
         self._output_dir = Path(output_dir)
+        self.trace_recorder = None
         self.reset()
 
     # -- private file resolution -----------------------------------------
@@ -247,9 +248,16 @@ class EnvState:
                 self._run_artifacts.add(name)
             if not self._step_open:
                 self._write_manifest()
+            if self.trace_recorder is not None:
+                self.trace_recorder.record_artifact(destination, step_idx=step)
             return name
         except Exception as exc:
             logger.warning("failed to save artifact %s: %s", name, exc)
+            if self.trace_recorder is not None:
+                self.trace_recorder.emit(
+                    "artifact_failed",
+                    {"name": name, "step_idx": step, "error": str(exc)},
+                )
             return None
         finally:
             temporary.unlink(missing_ok=True)
@@ -344,6 +352,14 @@ class EnvState:
             elapsed_s=elapsed_s,
             extras=copy.deepcopy(extras or {}),
         )
+        if self.trace_recorder is not None:
+            from rpent.runtime.trace import current_trace_scope
+
+            scope = current_trace_scope()
+            for key in ("tool_call_id", "turn_id"):
+                value = getattr(scope, key)
+                if value is not None:
+                    record.extras[key] = value
         self._steps.append(record)
         self._step_open = True
         try:
@@ -378,6 +394,11 @@ class EnvState:
         if resolved_step is None:
             raise ValueError(f"step {step} must be -1 or nonnegative")
         return copy.deepcopy(self._record_for(resolved_step))
+
+    def update_step_extras(self, step: int, extras: dict[str, Any]) -> None:
+        """Attach completed media metadata to an already recorded step."""
+        self._record_for(step).extras.update(copy.deepcopy(extras))
+        self._write_manifest()
 
     def records(self) -> list[StepRecord]:
         return copy.deepcopy(self._steps)

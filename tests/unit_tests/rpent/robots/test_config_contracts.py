@@ -215,6 +215,7 @@ def test_robocasa_config_defaults_and_valid_override(tmp_path: Path) -> None:
     assert config.recipe_tag == "PnPCounterToCab_pretrain_s11"
     assert config.output_dir == tmp_path
     assert config.prompt_vars == {
+        "enable_vla": True,
         "task_name": "PnPCounterToCab",
         "split": "pretrain",
         "seed": 11,

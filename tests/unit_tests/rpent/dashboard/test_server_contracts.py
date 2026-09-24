@@ -163,6 +163,51 @@ def test_the_run_timeout_is_never_inherited_by_the_check(
     assert captured["request"].resolved_timeout_s() == 30
 
 
+def test_runtime_llm_is_server_owned_and_http_cannot_replace_its_credentials(
+    monkeypatch, state
+):
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    from rpent.llm.client import LLMConfig
+
+    key = "configured-dashboard-private-key"
+    config = LLMConfig(
+        provider="openai",
+        model="runtime-model",
+        api_key=key,
+        base_url="https://runtime.example/v1",
+        openai_format="chat",
+    )
+
+    def build(self):
+        assert self == config
+        return FunctionModel(
+            lambda messages, info: ModelResponse(parts=[TextPart("ok")])
+        )
+
+    monkeypatch.setattr(LLMConfig, "build_model", build)
+    server = _server(state, planner="api", llm_config=config)
+    client = _client(server)
+    assert client.get("/api/session/config").json() == {
+        "planner": "api",
+        "model": "openai-chat:runtime-model",
+    }
+    response = client.post(
+        "/api/llm/check",
+        json={
+            "api_key": "injected",
+            "base_url": "https://injected.invalid",
+            "llm_config": {"model": "injected"},
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == STATUS_OK
+    assert response.json()["model"] == "openai-chat:runtime-model"
+    assert response.json()["base_url"] == "https://runtime.example/v1"
+    assert key not in response.text
+
+
 def test_a_concurrent_check_is_rejected_with_409(
     monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:

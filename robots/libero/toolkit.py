@@ -39,12 +39,15 @@ logger = get_logger("libero_toolkit")
 class LiberoToolkit(Toolkit):
     """Toolkit for the LIBERO robot."""
 
+    VLA_TOOLS = frozenset({"pi0_pick", "pi0_doubled"})
+
     def __init__(
         self,
         *,
         runtime_kwargs: dict[str, Any],
         dashboard_events: DashboardEventSink,
         memory: MemoryManager,
+        enable_vla: bool = True,
         mode: str = "evaluation",
         attempts_per_session: int = 0,
         state_output_dir: Path | str | None = None,
@@ -59,6 +62,9 @@ class LiberoToolkit(Toolkit):
             memory=memory,
         )
         self._mode = mode
+        self._enable_vla = enable_vla and runtime_kwargs.get("model") is not None
+        if not self._enable_vla:
+            runtime_kwargs = {**runtime_kwargs, "model": None}
         self._solved: bool = False
         self._attempt: int = 1
         # Bound the resettable attempts owned by this planner session.
@@ -84,6 +90,8 @@ class LiberoToolkit(Toolkit):
         }
         for spec in libero_tools.TOOLS_SPEC:
             name = spec["name"]
+            if name in self.VLA_TOOLS and not self._enable_vla:
+                continue
             if name == "reset" and self._mode != "exploration":
                 continue
             if name in state_handlers:
@@ -164,17 +172,45 @@ class LiberoToolkit(Toolkit):
             log={"command": command, "result": result, "elapsed_s": elapsed_s},
         )
         self._solved |= record.terminated
-        if self._dashboard_events.enabled:
+        if self._dashboard_events.enabled or getattr(self, "capture_video", False):
             try:
                 frames = self._primitives.frame_slice(frame_start)
                 if frames:
                     candidate = f"action_{command['action']}.mp4"
-                    self._state.save(
+                    saved = self._state.save(
                         candidate,
                         frames,
                         step=record.step_idx,
                         fps=20,
                     )
+                    if saved is not None:
+                        clip_path = self._state.artifact_path(
+                            saved, step=record.step_idx
+                        )
+                        episode_path = self._state.artifact_path(
+                            "episode.mp4", step=None
+                        )
+                        self._state.update_step_extras(
+                            record.step_idx,
+                            {
+                                "videos": [
+                                    {
+                                        "video_ref": clip_path.relative_to(
+                                            episode_path.parent
+                                        ).as_posix(),
+                                        "frame_start": 0,
+                                        "frame_end": len(frames),
+                                        "fps": 20,
+                                    },
+                                    {
+                                        "video_ref": "episode.mp4",
+                                        "frame_start": frame_start,
+                                        "frame_end": self._action_frame_cursor,
+                                        "fps": 20,
+                                    },
+                                ],
+                            },
+                        )
             except Exception as e:
                 logger.warning(
                     "failed to save action clip for step %s: %s",

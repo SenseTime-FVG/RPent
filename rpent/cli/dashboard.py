@@ -28,14 +28,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rpent.cli.main import (
+    _configured_model_name,
     _handoff_message,
     _serialize_messages,
 )
-from rpent.context import assemble_context
 from rpent.dashboard.events import RunStartedEvent
+from rpent.data_convert import convert_planner_input
 from rpent.memory import MemoryManager
 from rpent.planner.base import build_planner
 from rpent.robots import get_toolkit
+from rpent.runtime.lifecycle import activate_trace, close_toolkit_trace, create_trace
 from rpent.utils.config import get_memory_dir
 from rpent.utils.logging import get_logger, init_output_dir
 
@@ -67,7 +69,8 @@ def run_dashboard_session(
     runtime_components = tuple(
         component
         for component in dashboard_spec["runtime_components"]
-        if not component.get("planners") or args.planner in component["planners"]
+        if (not component.get("planners") or args.planner in component["planners"])
+        and (getattr(args, "enable_vla", True) or component["name"] != "vla")
     )
     dashboard_spec = {**dashboard_spec, "runtime_components": runtime_components}
     shared_components = {
@@ -86,7 +89,12 @@ def run_dashboard_session(
             "Dashboard task control cannot use --env-endpoint because each "
             "TaskRun requires a fresh owned env_server"
         )
-    if args.planner == "api" and not args.model:
+    runtime = getattr(args, "agent_runtime", None)
+    if runtime is not None:
+        runtime.validate_resources()
+    if args.planner == "flash" and not getattr(args, "enable_vla", True):
+        parser.error("Flash Mode requires VLA; remove --no-vla")
+    if args.planner == "api" and not args.model and not (runtime and runtime.llm):
         parser.error("--model is required when --planner=api")
 
     if args.output_dir is None:
@@ -109,6 +117,7 @@ def run_dashboard_session(
         planner=args.planner,
         model=args.model,
         base_url=args.base_url,
+        llm_config=runtime.llm if runtime is not None else None,
     )
     dashboard_url = dashboard_server.start()
     print(f"Dashboard: {dashboard_url}", flush=True)
@@ -246,6 +255,7 @@ def _run_dashboard_task(
                     toolkit = get_toolkit(
                         args.robot_name,
                         runtime_kwargs=runtime_kwargs,
+                        enable_vla=getattr(args, "enable_vla", True),
                         dashboard_events=state,
                         config=run_config,
                         mode="exploration" if task_args.explore else "evaluation",
@@ -258,13 +268,21 @@ def _run_dashboard_task(
                     toolkit = get_toolkit(
                         args.robot_name,
                         runtime_kwargs=runtime_kwargs,
+                        enable_vla=getattr(args, "enable_vla", True),
                         dashboard_events=state,
                         config=run_config,
                     )
                 solved = False
                 state.bind_toolkit(toolkit)
                 memory_manager = toolkit.memory
+                trace = None
                 try:
+                    trace = create_trace(
+                        state_output_dir,
+                        getattr(args, "agent_runtime", None),
+                        state,
+                        toolkit=toolkit,
+                    )
                     planner = build_planner(
                         args.planner,
                         output_dir=output_dir,
@@ -280,16 +298,17 @@ def _run_dashboard_task(
                         no_images=args.no_images,
                         runtime=getattr(args, "agent_runtime", None),
                     )
-                    context = assemble_context(
+                    context = convert_planner_input(
                         prompt=system_prompt, query=session_message
                     )
-                    result = planner.solve(
-                        system_prompt=context.system_prompt,
-                        user_message=context.user_message,
-                        toolkit=toolkit,
-                        max_turns=args.max_turns,
-                        dashboard_interaction=state,
-                    )
+                    with activate_trace(trace):
+                        result = planner.solve(
+                            system_prompt=context.system_prompt,
+                            user_message=context.user_message,
+                            toolkit=toolkit,
+                            max_turns=args.max_turns,
+                            dashboard_interaction=state,
+                        )
                     finish_result = result.finish_result
                     messages += result.messages
                     stats = result.stats
@@ -302,7 +321,12 @@ def _run_dashboard_task(
                             )
                 finally:
                     state.unbind_toolkit(toolkit)
-                    toolkit.close()
+                    close_toolkit_trace(
+                        toolkit,
+                        trace,
+                        error=agent_error,
+                        cancelled=state.task_replacement_requested,
+                    )
                 if solved or state.task_replacement_requested:
                     break
                 if agent_error:
@@ -338,7 +362,7 @@ def _run_dashboard_task(
         transcript_path = output_dir / f"transcript_{run_config.recipe_tag}.json"
         record = {
             **run_config.task_desc,
-            "model": args.model,
+            "model": _configured_model_name(args),
             "elapsed_s": round(time.time() - started, 1),
             "finish": finish_result,
             "stats": stats,

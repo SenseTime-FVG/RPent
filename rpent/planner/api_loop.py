@@ -89,6 +89,18 @@ def _user_message_log(message: str | list[str | BinaryContent]) -> str:
     return "\n".join(part if isinstance(part, str) else "[image]" for part in message)
 
 
+def _record_stop(run: Any | None, *, status: str, reason: str) -> None:
+    """Distinguish planner stop boundaries from SDK iterator cleanup cancellation."""
+    from rpent.runtime.trace import current_trace
+
+    recorder = current_trace()
+    if recorder is not None:
+        if run is None:
+            recorder.mark_run_stop(status=status, reason=reason)
+        else:
+            recorder.mark_agent_stop(run.run_id, status=status, reason=reason)
+
+
 class ApiAgentLoop:
     """Planner that runs the tool-calling loop via a pydantic-ai ``Agent``."""
 
@@ -269,6 +281,7 @@ class ApiAgentLoop:
                     async for node in run:
                         if interactive and _inject_pending(run):
                             quit_requested = True
+                            _record_stop(run, status="cancelled", reason="user_quit")
                             break
                         if Agent.is_call_tools_node(node):
                             run_turns += 1
@@ -290,11 +303,13 @@ class ApiAgentLoop:
 
                             if observer.finish_result is not None:
                                 logger.info("FINISH called: %s", observer.finish_result)
+                                _record_stop(run, status="completed", reason="finish")
                                 break
                             if observer.turns >= max_turns:
                                 logger.info(
                                     "reached max_turns=%d. Stopping.", max_turns
                                 )
+                                _record_stop(run, status="limit", reason="max_turns")
                                 break
                         elif Agent.is_end_node(node):
                             ended_without_tool = (
@@ -343,6 +358,7 @@ class ApiAgentLoop:
                     break
                 nxt = await _await_next()
                 if nxt is None:
+                    _record_stop(None, status="cancelled", reason="user_quit")
                     break
                 seed = nxt
                 messages.append({"role": "user", "content": seed})
@@ -446,6 +462,7 @@ class ApiAgentLoop:
     def _build_agent(self, system_prompt: str, toolkit: Toolkit) -> Agent:
         """Build an Agent for terminal or Dashboard execution."""
         from rpent.runtime.factory import build_runtime_agent
+        from rpent.runtime.trace import RuntimeTraceCapability
 
         thinking_effort: str | bool = self._reasoning_effort
         if thinking_effort == "none":
@@ -461,6 +478,7 @@ class ApiAgentLoop:
             max_tokens=self._max_tokens,
             runtime=self._runtime,
             capabilities=[
+                RuntimeTraceCapability(),
                 Thinking(effort=thinking_effort),
                 ProcessHistory(
                     processor=partial(
@@ -685,12 +703,19 @@ class _ApiDashboardSession:
                         self._observer.finish_result is not None
                         or self._observer.turns >= self._max_turns
                     ):
+                        finished = self._observer.finish_result is not None
+                        _record_stop(
+                            run,
+                            status="completed" if finished else "limit",
+                            reason="finish" if finished else "max_turns",
+                        )
                         self._control.end()
                         return False
                     if self._pending_prompts:
                         # Dashboard input accepted at this tool boundary starts
                         # a fresh run from the checkpoint captured below.
                         node = await run.next(node)
+                        _record_stop(run, status="completed", reason="message_handoff")
                         break
                     node = await run.next(node)
 

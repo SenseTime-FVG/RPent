@@ -27,7 +27,7 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
 
-from rpent.context import ContextDocument
+from rpent.data_convert import TextDocument
 from rpent.embodied_agent import EmbodiedAgent, McpServer
 from rpent.llm import LLMConfig
 from rpent.planner.base import PlannerResult
@@ -65,6 +65,35 @@ class _RobotTools:
                 return ToolResult(name=name, result={"error": "pose unreachable"})
             return ToolResult(name=name, result={"pose": input_dict["pose"]})
         return ToolResult(name=name, result={"camera": "front", "_image_bytes": b"png"})
+
+
+def test_mcp_allowlist_hides_and_rejects_unselected_tools(tmp_path: Path) -> None:
+    from rpent.embodied_agent import _McpToolkit
+
+    robot = _RobotTools()
+    server = HttpMcpServer(robot)
+    server.start()
+    toolkit = _McpToolkit(
+        [McpServer(name="robot", url=server.url, tools=("snapshot",))], tmp_path
+    )
+    try:
+        toolkit.start()
+        assert {item["name"] for item in toolkit.get_tools_spec()} == {
+            "robot__snapshot",
+            "finish",
+        }
+        assert (
+            "unknown tool"
+            in toolkit.execute_tool("robot__move_eef", {"pose": "target"}).result[
+                "error"
+            ]
+        )
+        assert not robot.calls
+        toolkit.execute_tool("robot__snapshot", {})
+        assert robot.calls == [("snapshot", {})]
+    finally:
+        toolkit.close()
+        server.stop()
 
 
 def test_embodied_runtime_delegates_before_executing_robot_tool(tmp_path, monkeypatch):
@@ -209,9 +238,7 @@ def test_embodied_agent_discovers_calls_and_preserves_images(
     image = BinaryContent(data=b"initial-png", media_type="image/png")
     context_args = (
         {
-            "memory": [
-                ContextDocument("grasp", "Use the top grasp.", "memory/grasp.md")
-            ],
+            "memory": [TextDocument("grasp", "Use the top grasp.", "memory/grasp.md")],
             "initial_context": ["Initial camera", image],
         }
         if with_context
@@ -265,6 +292,8 @@ def test_missing_skill_fails_before_mcp_startup(
     with pytest.raises(FileNotFoundError):
         agent.run("task", system_prompt="rules", skills=[tmp_path / "missing.md"])
     assert not (tmp_path / "episode").exists()
+
+
 def test_episode_hands_motion_to_benchmark_and_returns_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

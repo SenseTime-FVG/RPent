@@ -34,11 +34,14 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rpent.utils.logging import get_logger
 
 logger = get_logger("check")
+
+if TYPE_CHECKING:
+    from rpent.llm.client import LLMConfig
 
 # ---------------------------------------------------------------------------
 # Contract
@@ -169,12 +172,27 @@ class LlmCheckRequest:
             optional for ``claude_code`` and ``codex``.
         base_url: Base URL overriding the backend's own env var.
         timeout_s: Wall-clock cap. Defaults per backend when ``None``.
+        llm_config: Server-owned full API configuration, taking precedence over
+            model/base_url shorthand. Never accepted from HTTP request data.
     """
 
     planner: str = "api"
     model: str | None = None
     base_url: str | None = None
     timeout_s: int | None = None
+    llm_config: LLMConfig | None = field(default=None, repr=False)
+
+    def resolved_model(self) -> str | None:
+        """Return the model identity without including endpoint credentials."""
+        if self.llm_config is None:
+            return self.model
+        config = self.llm_config
+        provider = (
+            "openai-chat"
+            if config.provider == "openai" and config.openai_format == "chat"
+            else config.provider
+        )
+        return f"{provider}:{config.model}"
 
     def resolved_timeout_s(self) -> int:
         """Return the effective timeout, applying the per-backend default."""
@@ -194,7 +212,8 @@ class LlmCheckResult:
         model: The model id that was used, when known.
         credential_env: Name of the credential env var consulted, when known.
             The value is never captured.
-        credential_present: Whether that env var was set and non-empty.
+        credential_present: Whether the effective credential is non-empty,
+            including a key supplied directly through ``LLMConfig``.
         base_url: The base URL override in effect, when given.
         base_url_env: Name of the env var that supplies the base URL otherwise.
         detail: Verbatim error text from the provider or SDK. Empty on success.
@@ -263,7 +282,7 @@ def check_llm(request: LlmCheckRequest) -> LlmCheckResult:
             ok=False,
             status=STATUS_MISSING_CONFIG,
             planner=planner,
-            model=request.model,
+            model=request.resolved_model(),
             detail=(
                 f"unknown planner {planner!r}; expected one of "
                 f"{', '.join(CHECK_PLANNERS)}"
@@ -275,7 +294,7 @@ def check_llm(request: LlmCheckRequest) -> LlmCheckResult:
             ok=False,
             status=STATUS_SDK_ERROR,
             planner=planner,
-            model=request.model,
+            model=request.resolved_model(),
             detail=(
                 "check_llm() is synchronous and cannot run inside an active "
                 "event loop; call it from a worker thread instead."
@@ -293,7 +312,7 @@ def check_llm(request: LlmCheckRequest) -> LlmCheckResult:
     logger.info(
         "checking planner %s (model=%s)",
         planner,
-        request.model or "<backend default>",
+        request.resolved_model() or "<backend default>",
     )
     try:
         return checker(request)
@@ -302,8 +321,8 @@ def check_llm(request: LlmCheckRequest) -> LlmCheckResult:
             ok=False,
             status=STATUS_SDK_ERROR,
             planner=planner,
-            model=request.model,
-            detail=_describe(exc),
+            model=request.resolved_model(),
+            detail=_describe(exc, request),
         )
 
 
@@ -330,6 +349,13 @@ def redact_secrets(text: str) -> str:
         if value and len(value) >= _MIN_SECRET_LEN and value in text:
             text = text.replace(value, f"<{env_name}>")
     return text
+
+
+def _redact_request_secret(text: str, request: LlmCheckRequest) -> str:
+    """Also scrub a Python/config-supplied key which may not exist in the env."""
+    text = redact_secrets(text)
+    key = request.llm_config.api_key if request.llm_config is not None else None
+    return text.replace(key, "<configured API key>") if key else text
 
 
 def _has_cli_login(planner: str) -> bool:
@@ -406,9 +432,11 @@ def _sdk_probe_budget(request: LlmCheckRequest, *, cli_login_only: bool) -> int:
     return budget
 
 
-def _describe(exc: BaseException) -> str:
+def _describe(exc: BaseException, request: LlmCheckRequest | None = None) -> str:
     """Render an exception as ``TypeName: message``, redacted and capped."""
     text = redact_secrets(f"{type(exc).__name__}: {exc}")
+    if request is not None:
+        text = _redact_request_secret(text, request)
     if len(text) > _DETAIL_LIMIT:
         return text[:_DETAIL_LIMIT] + " …[truncated]"
     return text
@@ -421,23 +449,33 @@ def _describe(exc: BaseException) -> str:
 
 def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
     """Probe the pydantic-ai ``api`` planner with one minimal request."""
-    model = (request.model or "").strip()
+    config = request.llm_config
+    model = (request.resolved_model() or "").strip()
     provider_name = model.split(":", 1)[0] if ":" in model else ""
     key_env = _API_KEY_ENV.get(provider_name)
     base_url_env = _API_BASE_URL_ENV.get(provider_name)
     key_present = bool(os.environ.get(key_env)) if key_env else None
+    base_url = config.base_url if config is not None else request.base_url
+    if config is not None and config.api_key is not None:
+        key_env = None
+        key_present = bool(config.api_key)
 
     def _result(status: str, **kwargs: Any) -> LlmCheckResult:
         return LlmCheckResult(
             ok=status == STATUS_OK,
             status=status,
             planner="api",
-            model=model or None,
+            model=_redact_request_secret(model, request) or None,
             credential_env=key_env,
             credential_present=key_present,
-            base_url=request.base_url,
+            base_url=_redact_request_secret(base_url, request) if base_url else None,
             base_url_env=base_url_env,
-            **kwargs,
+            **{
+                key: _redact_request_secret(value, request)
+                if isinstance(value, str)
+                else value
+                for key, value in kwargs.items()
+            },
         )
 
     if not model:
@@ -457,10 +495,12 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
                 f"'<provider>:<model>', e.g. 'anthropic:{model}'."
             ),
         )
-    if key_env is not None and not key_present:
+    if key_present is False:
         return _result(
             STATUS_MISSING_API_KEY,
-            detail=f"{key_env} is not set for provider {provider_name!r}.",
+            detail=f"{key_env} is not set for provider {provider_name!r}."
+            if key_env
+            else "the configured API key is empty.",
         )
 
     try:
@@ -469,17 +509,21 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
 
         from rpent.planner.base import build_api_model
     except ImportError as exc:
-        return _result(STATUS_SDK_ERROR, detail=_describe(exc))
+        return _result(STATUS_SDK_ERROR, detail=_describe(exc, request))
 
     try:
-        api_model = build_api_model(model, request.base_url)
+        api_model = (
+            config.build_model()
+            if config is not None
+            else build_api_model(model, request.base_url)
+        )
     except UserError as exc:
-        return _result(_classify_user_error(exc), detail=_describe(exc))
+        return _result(_classify_user_error(exc), detail=_describe(exc, request))
     except ValueError as exc:
         # ``model`` is non-empty by the checks above, so build_api_model's own
         # ValueError cannot fire here: this comes from provider resolution,
         # where infer_provider raises ValueError for an unknown prefix.
-        return _result(STATUS_UNSUPPORTED_PROVIDER, detail=_describe(exc))
+        return _result(STATUS_UNSUPPORTED_PROVIDER, detail=_describe(exc, request))
 
     timeout_s = request.resolved_timeout_s()
     logger.info("probe budget: %ds", timeout_s)
@@ -500,15 +544,15 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
     except ModelHTTPError as exc:
         return _result(
             _classify_http_status(exc.status_code),
-            detail=_describe(exc),
+            detail=_describe(exc, request),
             latency_s=round(time.monotonic() - started, 3),
         )
     except UserError as exc:
-        return _result(_classify_user_error(exc), detail=_describe(exc))
+        return _result(_classify_user_error(exc), detail=_describe(exc, request))
     except Exception as exc:  # noqa: BLE001 - classified below
         return _result(
             _classify_transport_error(exc),
-            detail=_describe(exc),
+            detail=_describe(exc, request),
             latency_s=round(time.monotonic() - started, 3),
         )
 

@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared initial context assembly for robot and external benchmark runs."""
+"""Pure conversion of caller-provided inputs to planner messages."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,7 +25,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class ContextDocument:
+class TextDocument:
     """Resolved text and its provenance, used as memory or a skill.
 
     Attributes:
@@ -47,10 +46,10 @@ class ContextDocument:
 
 
 @dataclass(frozen=True)
-class ContextBundle:
+class PlannerInput:
     """Separate context sources with projections for the existing planners.
 
-    Use :func:`assemble_context` to snapshot and validate input collections.
+    Use :func:`convert_planner_input` to snapshot and validate input collections.
     The projections preserve the current planner protocol; SDK adapters still
     own their message-role mapping. History and tool schemas remain owned by
     the planner and toolkit, respectively.
@@ -58,8 +57,8 @@ class ContextBundle:
 
     prompt: str
     query: str
-    memory: tuple[ContextDocument, ...] = ()
-    skills: tuple[ContextDocument, ...] = ()
+    memory: tuple[TextDocument, ...] = ()
+    skills: tuple[TextDocument, ...] = ()
     initial_context: tuple[str | BinaryContent, ...] = ()
 
     @property
@@ -89,34 +88,14 @@ class ContextBundle:
         return message
 
 
-def load_skill(path: str | Path) -> ContextDocument:
-    """Read one skill file as UTF-8, preserving its content and resolved source.
-
-    Args:
-        path: Explicit Markdown file path. SKILL.md uses its parent directory
-            name as the title; other files use their filename stem.
-
-    Returns:
-        A document that can be supplied to ``assemble_context(skills=...)``.
-
-    File access and UTF-8 decoding errors propagate to the caller.
-    """
-    skill = Path(path)
-    return ContextDocument(
-        title=skill.parent.name if skill.name == "SKILL.md" else skill.stem,
-        text=skill.read_text(encoding="utf-8"),
-        source=str(skill.resolve()),
-    )
-
-
-def assemble_context(
+def convert_planner_input(
     *,
     prompt: str,
     query: str,
-    memory: Sequence[ContextDocument] = (),
-    skills: Sequence[ContextDocument] = (),
+    memory: Sequence[TextDocument] = (),
+    skills: Sequence[TextDocument] = (),
     initial_context: Sequence[str | BinaryContent] = (),
-) -> ContextBundle:
+) -> PlannerInput:
     """Assemble resolved context without filesystem, network, or model access.
 
     Args:
@@ -125,7 +104,7 @@ def assemble_context(
         memory: Already selected, authorized memory excerpts. They appear in
             user context, separately from system instructions.
         skills: Resolved skill documents, appended to the system instructions
-            in caller order. Use :func:`load_skill` for filesystem skills.
+            in caller order. Read filesystem skills with runtime.skills.load_skill.
         initial_context: Text and BinaryContent observations after the query
             and memory. Planner-specific multimodal limits still apply.
 
@@ -140,15 +119,15 @@ def assemble_context(
     memory_docs = tuple(memory)
     skill_docs = tuple(skills)
     for name, documents in (("memory", memory_docs), ("skills", skill_docs)):
-        if any(not isinstance(doc, ContextDocument) for doc in documents):
-            raise TypeError(f"{name} entries must be ContextDocument")
+        if any(not isinstance(doc, TextDocument) for doc in documents):
+            raise TypeError(f"{name} entries must be TextDocument")
     parts = tuple(initial_context)
     if any(not isinstance(part, str) for part in parts):
         from pydantic_ai import BinaryContent
 
         if any(not isinstance(part, (str, BinaryContent)) for part in parts):
             raise TypeError("initial_context parts must be text or BinaryContent")
-    return ContextBundle(
+    return PlannerInput(
         prompt=prompt,
         query=query,
         memory=memory_docs,

@@ -80,8 +80,9 @@ SDK。
 配置子 agent
 ~~~~~~~~~~~~
 
-安装可选的 ``runtime`` 依赖后，``api`` planner 可以把分析任务委派给指定的
-PydanticAI agent，继续使用现有执行循环：
+``api`` runtime 支持 context 策略、按需技能和轨迹记录，完整配置与离线样例
+见 :doc:`agent_runtime`。安装可选 ``runtime`` 依赖后，还可将任务委派给指定的
+PydanticAI agent：
 
 .. code-block:: bash
 
@@ -111,22 +112,26 @@ PydanticAI agent，继续使用现有执行循环：
 
 主 agent 获得 ``delegate_task(agent_name, task)`` 工具。每次调用都会创建独立
 的子会话，并返回文本结果。委派任务必须提供完整信息：父级的 query、memory
-片段、初始图片和会话历史不会自动复制。子 agent 只能使用显式列出且实际存在于
-父级工具目录中的 ``read_image``、``read_text_file``、``list_dir``，继续遵守
+片段、初始图片和会话历史不会自动复制。子 agent 可使用显式列出且实际存在于
+父级工具目录中的 ``read_image``、``read_text_file``、``list_dir``，以及绑定
+自己显式 ``skill_paths`` 目录的 ``read_skill``，继续遵守
 现有读取权限。``read_image`` 读取已记录的 step artifact；只传文本路径不会
 把图片发送给子 agent。机器人动作和 ``finish`` 由主 agent 调用。
 
 省略 ``model`` 时，子 agent 继承主 agent 已配置的模型、端点和重试策略。
+也可配置完整 ``llm``，它与 ``model`` 互斥。
 显式指定带提供商前缀的 ``model`` 时，使用该提供商的环境凭据和端点，不继承
 父级显式传入的 ``--base-url`` 或 ``LLMConfig.api_key``。输出 token 上限、
-thinking 设置和历史图片处理方式继承自 planner。
+thinking 设置和历史图片处理方式继承自 planner；显式子级 ``llm`` 使用自身
+的图像保留配置。
 
 独立的子 agent 模型调用可以并行，共享 RPent 工具集的调用仍串行执行；委派工具
 本身不占用工具执行槽。子 agent 共享父级 usage 和请求限制：现有 SDK 的
 ``max_turns + 1`` 请求阈值计入本次运行中父子 agent 的请求。SDK 在发起请求前
 检查已记录的 usage；并行处理中尚未计入的请求可能使最终次数超过该阈值。Token 和请求数
 统计包含子 agent；``turns_used`` 和 ``tool_calls`` 仍描述父级循环。Transcript
-记录父级的委派调用及其结果，不保存完整子会话。现有 planner 中断和超时机制
+记录父级的委派调用及其结果；full runtime trace 另外保存完整子会话。
+现有 planner 中断和超时机制
 也适用于委派任务。
 
 此 extra 使用 ``pydantic-ai-harness>=0.34,<0.35``，其核心依赖要求
@@ -342,21 +347,22 @@ agent SDK，可以实现 ``rpent.planner.base.Planner`` 协议，并在
 
 .. _planner-context:
 
-组装 planner 上下文
--------------------
+转换 planner 输入
+-----------------
 
-``rpent.context`` 提供 CLI、Dashboard 和 ``EmbodiedAgent`` 共用的初始上下文
-组装入口。它分别保留已渲染的 prompt、当前 query、选定的 memory、已解析的
+``rpent.data_convert`` 提供 CLI、Dashboard 和 ``EmbodiedAgent`` 共用的初始输入
+转换入口。它分别保留已渲染的 prompt、当前 query、选定的 memory、已解析的
 skill 和初始观测，最后适配为现有 planner 参数：
 
 .. code-block:: python
 
-   from rpent.context import ContextDocument, assemble_context, load_skill
+   from rpent.data_convert import TextDocument, convert_planner_input
+   from rpent.runtime.skills import load_skill
 
-   context = assemble_context(
+   context = convert_planner_input(
        prompt="Use the registered robot tools.",
        query="Place the block in the bowl.",
-       memory=[ContextDocument("Grasp", "Recheck the object pose.", "memory/grasp.md")],
+       memory=[TextDocument("Grasp", "Recheck the object pose.", "memory/grasp.md")],
        skills=[load_skill("benchmark/SKILL.md")],
    )
    result = planner.solve(
@@ -366,12 +372,12 @@ skill 和初始观测，最后适配为现有 planner 参数：
        max_turns=100,
    )
 
-``assemble_context`` 不负责读取来源。机器人的 prompt 工厂仍通过
+``convert_planner_input`` 不负责读取来源。机器人的 prompt 工厂仍通过
 ``PromptBundle`` 渲染模板。``load_skill`` 显式读取一个 UTF-8 文件，不自动
 发现 skill，也不解析 frontmatter；文件读取和解码错误会直接抛出。文件名为
 ``SKILL.md`` 时使用父目录名作为标题，其他文件使用不含扩展名的文件名。
 
-``ContextBundle`` 保留 ``prompt``、``query``、``memory``、``skills`` 和
+``PlannerInput`` 保留 ``prompt``、``query``、``memory``、``skills`` 和
 ``initial_context``；memory 和 skill 文档保留各自的 ``source``。输入集合
 会复制为元组，便于跨次运行复用。System 参数由 prompt 和 skill 段落组成；
 user 参数由 query、memory 参考文本和初始观测依次组成。图像对象原样传递。
@@ -383,7 +389,8 @@ user 参数由 query、memory 参考文本和初始观测依次组成。图像�
 它与首条 user message 合并。组装函数不改变这一角色映射，也不授予工具权限。
 对话历史、图像裁剪、缓存和上下文窗口处理仍由 planner 负责；工具 schema
 和执行由 toolkit 负责。Memory 检索由调用方或现有 memory 工具完成，
-组装函数不会自动检索或截断内容。
+转换函数不会自动检索或截断内容。逐轮历史策略由 :doc:`agent_runtime` 提供，
+该指南也包含 ``rpent.context`` 与 ``assemble_context`` 的迁移名称。
 
 设置 planner 的运行限制
 -----------------------

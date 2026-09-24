@@ -90,8 +90,9 @@ Relevant ``api`` planner knobs:
 Configured sub-agents
 ~~~~~~~~~~~~~~~~~~~~~
 
-The optional ``runtime`` extra lets the ``api`` planner delegate analysis to
-named PydanticAI agents while retaining its existing execution loop:
+The ``api`` runtime supports context policies, on-demand skills and traces; see
+:doc:`agent_runtime` for the complete configuration and an offline example.
+The optional ``runtime`` extra adds delegation to named PydanticAI agents:
 
 .. code-block:: bash
 
@@ -123,17 +124,20 @@ Other planners reject this option.
 The parent receives ``delegate_task(agent_name, task)``. Each call starts a fresh
 child conversation and returns its text result. The task must be self-contained:
 the parent's query, memory excerpts, initial images, and conversation history are
-not copied. Children may use only explicitly listed ``read_image``,
-``read_text_file``, and ``list_dir`` tools present in the parent's catalog.
+not copied. Children may use explicitly listed ``read_image``,
+``read_text_file``, and ``list_dir`` tools present in the parent's catalog, plus
+``read_skill`` backed by their own explicit ``skill_paths`` directories.
 Existing reader permissions remain in force. ``read_image`` reads recorded step
 artifacts; a text path alone does not transfer an image to a child. Robot actions
 and ``finish`` remain with the parent.
 
 An omitted ``model`` inherits the parent's configured model, endpoint, and retry
-policy. An explicit provider-prefixed ``model`` uses the selected provider's
+policy. A child can instead specify a full ``llm`` configuration, mutually
+exclusive with ``model``. An explicit provider-prefixed ``model`` uses the selected provider's
 environment credentials and endpoint; it does not inherit an explicit parent
 ``--base-url`` or ``LLMConfig.api_key``. Output-token limits, thinking settings,
-and history-image handling are inherited from the planner.
+and history-image handling are inherited from the planner unless the child's
+full ``llm`` provides its own image settings.
 
 Independent child model calls can run concurrently. Calls through the shared
 RPent toolset remain serial, and delegation itself does not occupy its tool slot.
@@ -142,8 +146,9 @@ of ``max_turns + 1`` counts parent and child requests within that run. The SDK
 checks recorded usage before a request; concurrent in-flight requests can cause
 the final request count to exceed that threshold.
 Token/request statistics include delegates; ``turns_used`` and ``tool_calls``
-continue to describe the parent loop. The transcript shows parent delegation
-calls and their returned results, not complete child conversations. Existing
+continue to describe the parent loop. The existing transcript shows parent
+delegation calls and their returned results. Full runtime traces also contain
+child conversations. Existing
 planner interruption and timeout behavior also applies to delegated work.
 
 This extra selects ``pydantic-ai-harness>=0.34,<0.35``, whose core dependency is
@@ -379,22 +384,23 @@ your custom planner.
 
 .. _planner-context:
 
-Assemble planner context
-------------------------
+Convert planner input
+---------------------
 
-``rpent.context`` provides the shared initial context assembly used by the CLI,
+``rpent.data_convert`` provides the shared initial input conversion used by the CLI,
 Dashboard, and ``EmbodiedAgent``. It keeps the rendered prompt, current query,
 selected memory, resolved skills, and initial observations separate until they
 are projected onto the existing planner arguments:
 
 .. code-block:: python
 
-   from rpent.context import ContextDocument, assemble_context, load_skill
+   from rpent.data_convert import TextDocument, convert_planner_input
+   from rpent.runtime.skills import load_skill
 
-   context = assemble_context(
+   context = convert_planner_input(
        prompt="Use the registered robot tools.",
        query="Place the block in the bowl.",
-       memory=[ContextDocument("Grasp", "Recheck the object pose.", "memory/grasp.md")],
+       memory=[TextDocument("Grasp", "Recheck the object pose.", "memory/grasp.md")],
        skills=[load_skill("benchmark/SKILL.md")],
    )
    result = planner.solve(
@@ -404,13 +410,13 @@ are projected onto the existing planner arguments:
        max_turns=100,
    )
 
-``assemble_context`` performs no source retrieval. Robot prompt factories still
+``convert_planner_input`` performs no source retrieval. Robot prompt factories still
 render their templates through ``PromptBundle``. ``load_skill`` explicitly reads
 one UTF-8 file; it does not discover skills or interpret frontmatter. File and
 decoding errors propagate. Skill titles use the parent directory for ``SKILL.md``
 and the filename stem for other files.
 
-``ContextBundle`` retains ``prompt``, ``query``, ``memory``, ``skills``, and
+``PlannerInput`` retains ``prompt``, ``query``, ``memory``, ``skills``, and
 ``initial_context``. Memory and skill documents retain their ``source`` values.
 The input collections are copied to tuples so they can be reused across runs.
 The system projection appends skill sections to the prompt; the user projection
@@ -424,7 +430,9 @@ Claude Code currently combine it with the initial user message. Assembly does
 not change that role mapping or grant tool access. Planners continue to own
 conversation history, image pruning, caching, and context-window handling;
 toolkits own tool schemas and execution. Memory lookup remains with the caller
-or existing memory tools, and no automatic retrieval or truncation is performed.
+or existing memory tools, and conversion performs no automatic retrieval or
+truncation. Per-request history policies belong to :doc:`agent_runtime`, which
+also documents the migration from ``rpent.context`` and ``assemble_context``.
 
 Configure planner limits
 ------------------------

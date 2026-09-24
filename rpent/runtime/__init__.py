@@ -14,6 +14,31 @@
 
 """Configuration for composed API agents, independent of model SDK imports."""
 
+from typing import TYPE_CHECKING
+
 from rpent.runtime.config import RuntimeConfig, SubAgentConfig
 
-__all__ = ["RuntimeConfig", "SubAgentConfig"]
+if TYPE_CHECKING:
+    from rpent.runtime.context_engine import ContextPolicy, summarize_history
+    from rpent.runtime.trace import TraceConfig
+
+__all__ = [
+    "RuntimeConfig",
+    "SubAgentConfig",
+    "ContextPolicy",
+    "TraceConfig",
+    "summarize_history",
+]
+
+
+def __getattr__(name: str):
+    # Configuration discovery remains usable without loading the model SDK.
+    if name in {"ContextPolicy", "summarize_history"}:
+        from rpent.runtime import context_engine
+
+        return getattr(context_engine, name)
+    if name == "TraceConfig":
+        from rpent.runtime.trace import TraceConfig
+
+        return TraceConfig
+    raise AttributeError(name)

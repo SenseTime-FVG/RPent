@@ -28,6 +28,27 @@ def system_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
     """Return the RoboTwin system prompt for the selected run mode."""
+    if not (variables or {}).get("enable_vla", True):
+        explore = (variables or {}).get("mode", "eval") == "explore"
+        parts = explore_parts if explore else evaluate_parts
+        return {
+            "ROLE": parts.ROLE,
+            "READ ORDER": parts.READ_ORDER,
+            "CONTROL": (
+                "VLA is disabled. Use only the exposed scripted primitives. "
+                "Ground every target in current perception, specify the selected "
+                "arm, and inspect the returned state after each bounded action. "
+                "Stop if the task needs an unavailable learned capability; do "
+                "not call tools absent from the schema or start model services. "
+                "Treat memory and guides as technique references subject to "
+                "this run's available tools."
+            ),
+            "PERCEPTION": evaluate_parts.PERCEPTION,
+            "RUNTIME": parts.RUNTIME,
+            "BUDGET AND SUCCESS": parts.BUDGET_AND_SUCCESS,
+            "MODE": parts.USER_MODE,
+            **({"MEMORY": parts.MEMORY, "OUTPUT": parts.OUTPUT} if explore else {}),
+        }
     if (variables or {}).get("mode", "eval") == "explore":
         return explore_parts.system_prompt()
     return evaluate_parts.system_prompt(variables)

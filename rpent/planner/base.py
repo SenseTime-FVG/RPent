@@ -193,6 +193,10 @@ def build_planner(
 
     if runtime is not None and planner_type != "api":
         raise ValueError("runtime is supported only by the api planner")
+    if runtime is not None and runtime.llm is not None:
+        if llm_config is not None or model is not None or base_url is not None:
+            raise ValueError("pass runtime.llm or llm_config/model/base_url, not both")
+        llm_config = runtime.llm
     if llm_config is not None and planner_type != "api":
         raise ValueError("llm_config is supported only by the api planner")
     if llm_config is not None and (model is not None or base_url is not None):

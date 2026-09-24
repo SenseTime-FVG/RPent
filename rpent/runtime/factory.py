@@ -19,25 +19,90 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from contextvars import ContextVar
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent, RunContext, Tool
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, ProcessHistory
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset, ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
 
-from rpent.context import assemble_context, load_skill
+from rpent.data_convert import convert_planner_input
 from rpent.llm.client import build_model_settings
 from rpent.llm.retry import RetryLoggingModel
-from rpent.runtime.config import RuntimeConfig
+from rpent.runtime.config import RuntimeConfig, SubAgentConfig
+from rpent.runtime.context_engine import ContextEngineCapability
+from rpent.runtime.skills import SkillCatalog, load_skill
 
 if TYPE_CHECKING:
     from pydantic_ai.capabilities import AgentCapability, WrapRunHandler
     from pydantic_ai.run import AgentRunResult
     from pydantic_ai.usage import UsageLimits
 
-_CHILD_READERS = frozenset({"read_image", "read_text_file", "list_dir"})
+_CHILD_READERS = frozenset({"read_image", "read_text_file", "list_dir", "read_skill"})
+
+
+def _context_capabilities(
+    capabilities: Sequence[AgentCapability],
+    config: RuntimeConfig | SubAgentConfig,
+    parent: RuntimeConfig | None = None,
+) -> list[AgentCapability]:
+    """Place user context after observation capture and before image policies."""
+    selected = config
+    if parent is not None and all(
+        getattr(config, field) is None
+        for field in ("context", "context_engine", "context_engine_factory")
+    ):
+        selected = parent
+    engine = ContextEngineCapability(
+        engine=selected.context_engine,
+        factory=selected.context_engine_factory,
+        policy=selected.context,
+    )
+    result = list(capabilities)
+    if parent is not None and config.llm is not None:
+        from rpent.planner.api_loop import _prune_history_images
+
+        result = [
+            ProcessHistory(
+                partial(
+                    _prune_history_images,
+                    max_groups=config.llm.image_history_groups,
+                    preserve_initial_image_count=config.llm.preserve_initial_image_count,
+                )
+            )
+            if isinstance(capability, ProcessHistory)
+            and isinstance(capability.processor, partial)
+            and capability.processor.func is _prune_history_images
+            else capability
+            for capability in result
+        ]
+    index = next(
+        (
+            index
+            for index, capability in enumerate(result)
+            if isinstance(capability, ProcessHistory)
+        ),
+        len(result),
+    )
+    result.insert(index, engine)
+    return result
+
+
+def _skill_tools(
+    config: RuntimeConfig | SubAgentConfig,
+    tools: Sequence[Tool],
+    instructions: str,
+) -> tuple[list[Tool], str]:
+    catalog = SkillCatalog(config.skill_paths, max_bytes=config.skill_max_bytes)
+    result = list(tools)
+    if catalog.entries:
+        if any(tool.name == "read_skill" for tool in result):
+            raise ValueError("read_skill conflicts with a configured skill reader")
+        result.append(Tool(catalog.read_skill))
+        instructions = "\n\n".join(filter(None, [instructions, catalog.instructions]))
+    return result, instructions
 
 
 class _InheritRequestLimit(AbstractCapability):
@@ -110,13 +175,18 @@ def build_runtime_agent(
             toolkit already contains the reserved delegation tool name.
         ImportError: If delegation is configured without the runtime extra.
     """
+    if runtime is not None:
+        tools, system_prompt = _skill_tools(runtime, tools, system_prompt)
+        parent_capabilities = _context_capabilities(capabilities, runtime)
+    else:
+        parent_capabilities = list(capabilities)
     if runtime is None or not runtime.subagents:
         return Agent(
             model,
             instructions=system_prompt or None,
             tools=tools,
             model_settings=build_model_settings(model, max_tokens),
-            capabilities=capabilities,
+            capabilities=parent_capabilities,
         )
 
     try:
@@ -133,7 +203,7 @@ def build_runtime_agent(
     limits: ContextVar[UsageLimits | None] = ContextVar(
         "rpent_request_limits", default=None
     )
-    run_capabilities = [*capabilities, _InheritRequestLimit(limits)]
+    run_capabilities = [*parent_capabilities, _InheritRequestLimit(limits)]
     children = []
     for name, config in runtime.subagents.items():
         for tool_name in config.tools:
@@ -141,12 +211,26 @@ def build_runtime_agent(
                 raise ValueError(
                     f"sub-agent {name!r} cannot use tool {tool_name!r}; only artifact and text readers are supported"
                 )
+            if tool_name == "read_skill":
+                if not config.skill_paths:
+                    raise ValueError(
+                        f"sub-agent {name!r} requests read_skill without skill_paths"
+                    )
+                continue
             if tool_name not in catalog:
                 raise ValueError(
                     f"sub-agent {name!r} requests unavailable tool {tool_name!r}"
                 )
         child_model = model
-        if config.model is not None:
+        if config.llm is not None:
+            child_model = RetryLoggingModel(
+                config.llm.build_model(),
+                policy=config.llm.retry,
+                log_path=model.log_path
+                if isinstance(model, RetryLoggingModel)
+                else None,
+            )
+        elif config.model is not None:
             from rpent.planner.base import build_api_model
 
             child_model = RetryLoggingModel(
@@ -156,19 +240,28 @@ def build_runtime_agent(
                 if isinstance(model, RetryLoggingModel)
                 else None,
             )
-        context = assemble_context(
+        context = convert_planner_input(
             prompt=config.instructions,
             query="",
             skills=[load_skill(path) for path in config.skills],
         )
+        child_tools, child_instructions = _skill_tools(
+            config,
+            [catalog[key] for key in config.tools if key != "read_skill"],
+            context.system_prompt,
+        )
+        child_capabilities = [
+            *_context_capabilities(capabilities, config, runtime),
+            _InheritRequestLimit(limits),
+        ]
         child = Agent(
             child_model,
             name=name,
             description=config.description,
-            instructions=context.system_prompt,
+            instructions=child_instructions,
             model_settings=build_model_settings(child_model, max_tokens),
-            toolsets=[_SharedToolset([catalog[key] for key in config.tools], lock)],
-            capabilities=run_capabilities,
+            toolsets=[_SharedToolset(child_tools, lock)],
+            capabilities=child_capabilities,
         )
         children.append(SubAgent(child))
 

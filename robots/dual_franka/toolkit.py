@@ -61,6 +61,7 @@ class DualFrankaToolkit(FrankaToolkit):
 
     _tools_module = dual_franka_tools
     _primitives_cls = dual_franka_tools.DualFrankaPrimitives
+    VLA_TOOLS = frozenset({"vla_right_grasp", "vla_handoff", "vla_left_place"})
 
     def __init__(
         self,
@@ -68,6 +69,7 @@ class DualFrankaToolkit(FrankaToolkit):
         runtime_kwargs: dict[str, Any],
         dashboard_events: DashboardEventSink,
         memory: MemoryManager,
+        enable_vla: bool = True,
         mode: str = "evaluation",
         attempts_per_session: int = 0,
         state_output_dir: Path | str | None = None,
@@ -93,6 +95,7 @@ class DualFrankaToolkit(FrankaToolkit):
         self._direct_verdict_event = threading.Event()
         self._direct_verdict: str | None = None
         super().__init__(
+            enable_vla=enable_vla,
             runtime_kwargs=runtime_kwargs,
             dashboard_events=dashboard_events,
             memory=memory,
@@ -500,11 +503,15 @@ class DualFrankaToolkit(FrankaToolkit):
         }
         for spec in self._tools_module.TOOLS_SPEC:
             name = spec["name"]
+            if name in self.VLA_TOOLS and not self._enable_vla:
+                continue
             if name in _EXPLORATION_ONLY_TOOLS and self._mode != "exploration":
                 continue
             handler = state_handlers.get(name) or getattr(self._primitives, name, None)
             if handler is None:
                 continue
+            if name == "describe_dual_franka_setup":
+                handler = partial(self._describe_available_setup, handler)
             if self._mode == "exploration":
                 if name in _MOTION_TOOLS:
                     handler = partial(self._guard_motion, handler)
@@ -525,6 +532,22 @@ class DualFrankaToolkit(FrankaToolkit):
                 finish_spec,
                 partial(self._guarded_finish, finish_handler),
             )
+
+    @readonly
+    def _describe_available_setup(self, inner: Any) -> dict[str, Any]:
+        """Report capabilities available in this session's dispatch table."""
+        result = inner()
+        result["available_primitives"] = [
+            spec["name"]
+            for spec in self._tools_module.TOOLS_SPEC
+            if spec["name"] in self._tools
+        ]
+        result["vla"] = (
+            {**result.get("vla", {}), "enabled": True}
+            if self._enable_vla
+            else {"enabled": False}
+        )
+        return result
 
     def _read_operator_line(self, prompt: str) -> str | None:
         if sys.stdin is None or not sys.stdin.isatty():

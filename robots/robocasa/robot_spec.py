@@ -159,6 +159,7 @@ def get_toolkit(
     runtime_kwargs: dict[str, Any],
     dashboard_events: DashboardEventSink,
     config: RunConfig,
+    enable_vla: bool = True,
     mode: str = "evaluation",
     attempts_per_session: int = 0,
     state_output_dir: Path | str | None = None,
@@ -172,6 +173,7 @@ def get_toolkit(
         inbox_cell_tag=config.recipe_tag if mode == "exploration" else None,
     )
     return RoboCasaToolkit(
+        enable_vla=enable_vla,
         runtime_kwargs=runtime_kwargs,
         dashboard_events=dashboard_events,
         memory=memory,
@@ -264,6 +266,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         else f"{args.task_name}_s0"
     )
     prompt_vars = {
+        "enable_vla": getattr(args, "enable_vla", True),
         "task_name": args.task_name,
         "split": args.split,
         "seed": args.seed,
@@ -428,7 +431,10 @@ def _init_runtime(
         "vla": lambda rpc: {"vla_client": RoboCasaVLAClient(rpc)},
     }
     timeouts = {"env": 120.0, "vla": 300.0}
-    selected = set(starters) if components is None else components
+    selected = set(starters) if components is None else set(components)
+    enable_vla = getattr(args, "enable_vla", True)
+    if not enable_vla:
+        selected.discard("vla")
     unknown = selected.difference(starters)
     if unknown:
         raise ValueError(f"unknown RoboCasa runtime components: {sorted(unknown)}")
@@ -445,6 +451,8 @@ def _init_runtime(
             )
 
     runtime_kwargs: dict[str, Any] = {}
+    if not enable_vla:
+        runtime_kwargs["vla_client"] = None
     for component, (daemon, rpc) in pending.items():
         component_kwargs = try_wait_server(
             owned_daemons,

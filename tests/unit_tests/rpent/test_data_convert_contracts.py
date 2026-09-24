@@ -21,9 +21,9 @@ from pydantic_ai import BinaryContent
 
 
 def test_plain_context_preserves_rendered_prompts_exactly() -> None:
-    from rpent.context import assemble_context
+    from rpent.data_convert import convert_planner_input
 
-    context = assemble_context(prompt="Rules\n\n", query="  Operator task\n")
+    context = convert_planner_input(prompt="Rules\n\n", query="  Operator task\n")
 
     assert context.system_prompt == "Rules\n\n"
     assert context.user_message == "  Operator task\n"
@@ -31,11 +31,11 @@ def test_plain_context_preserves_rendered_prompts_exactly() -> None:
 
 
 def test_memory_is_reference_context_and_skills_are_instructions() -> None:
-    from rpent.context import ContextDocument, assemble_context
+    from rpent.data_convert import TextDocument, convert_planner_input
 
-    memory = ContextDocument("grasp", "Approach from above.", "memory/grasp.md")
-    skill = ContextDocument("pick", "Inspect after motion.\n", "skills/pick/SKILL.md")
-    context = assemble_context(
+    memory = TextDocument("grasp", "Approach from above.", "memory/grasp.md")
+    skill = TextDocument("pick", "Inspect after motion.\n", "skills/pick/SKILL.md")
+    context = convert_planner_input(
         prompt="Use the robot tools.\n",
         query="Place the block.",
         memory=[memory],
@@ -58,7 +58,8 @@ def test_memory_is_reference_context_and_skills_are_instructions() -> None:
 def test_skill_loads_fresh_utf8_content_with_provenance(
     tmp_path: Path, name: str
 ) -> None:
-    from rpent.context import assemble_context, load_skill
+    from rpent.data_convert import convert_planner_input
+    from rpent.runtime.skills import load_skill
 
     skill = tmp_path / "相机操作" / name
     skill.parent.mkdir()
@@ -71,13 +72,13 @@ def test_skill_loads_fresh_utf8_content_with_provenance(
     assert first.text == "观察当前画面。\n"
     assert second.text == "动作后再次观察。\n"
     assert first.source == str(skill.resolve())
-    assert assemble_context(
+    assert convert_planner_input(
         prompt="rules", query="task", skills=[first]
     ).system_prompt == (f"rules\n\n## Skill: {first.title}\n\n观察当前画面。\n")
 
 
 def test_missing_skill_preserves_the_file_error(tmp_path: Path) -> None:
-    from rpent.context import load_skill
+    from rpent.runtime.skills import load_skill
 
     path = tmp_path / "missing" / "SKILL.md"
     with pytest.raises(FileNotFoundError) as exc:
@@ -88,28 +89,28 @@ def test_missing_skill_preserves_the_file_error(tmp_path: Path) -> None:
 def test_assembly_does_not_read_memory_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from rpent.context import ContextDocument, assemble_context
+    from rpent.data_convert import TextDocument, convert_planner_input
 
     def reject_read(*args, **kwargs):
         raise AssertionError("assembly must not read source paths")
 
     monkeypatch.setattr(Path, "read_text", reject_read)
-    context = assemble_context(
+    context = convert_planner_input(
         prompt="rules",
         query="task",
-        memory=[ContextDocument("selected", "Approved excerpt.", "/unread/source.md")],
+        memory=[TextDocument("selected", "Approved excerpt.", "/unread/source.md")],
     )
     assert "Approved excerpt." in context.user_message
 
 
 def test_multimodal_context_keeps_query_prefix_and_observation_order() -> None:
-    from rpent.context import ContextDocument, assemble_context
+    from rpent.data_convert import TextDocument, convert_planner_input
 
     image = BinaryContent(data=b"png", media_type="image/png")
-    context = assemble_context(
+    context = convert_planner_input(
         prompt="rules",
         query="task",
-        memory=[ContextDocument("prior", "A previous grasp failed.")],
+        memory=[TextDocument("prior", "A previous grasp failed.")],
         initial_context=["Front camera at step 3", image, "Gripper open"],
     )
 
@@ -123,12 +124,12 @@ def test_multimodal_context_keeps_query_prefix_and_observation_order() -> None:
 
 
 def test_assembly_snapshots_collections_and_returns_fresh_planner_lists() -> None:
-    from rpent.context import ContextDocument, assemble_context
+    from rpent.data_convert import TextDocument, convert_planner_input
 
-    memory = [ContextDocument("prior", "Retain this.")]
-    skills = [ContextDocument("inspect", "Use the camera.")]
+    memory = [TextDocument("prior", "Retain this.")]
+    skills = [TextDocument("inspect", "Use the camera.")]
     observations = ["State at step 0"]
-    context = assemble_context(
+    context = convert_planner_input(
         prompt="rules",
         query="task",
         memory=memory,
@@ -150,17 +151,17 @@ def test_assembly_snapshots_collections_and_returns_fresh_planner_lists() -> Non
 
 @pytest.mark.parametrize("value", [b"raw image bytes", {"text": "unknown block"}, 3])
 def test_assembly_rejects_unsupported_observation_parts(value) -> None:
-    from rpent.context import assemble_context
+    from rpent.data_convert import convert_planner_input
 
     with pytest.raises(
         TypeError, match="initial_context parts must be text or BinaryContent"
     ):
-        assemble_context(prompt="rules", query="task", initial_context=[value])
+        convert_planner_input(prompt="rules", query="task", initial_context=[value])
 
 
 @pytest.mark.parametrize("field", ["memory", "skills"])
 def test_assembly_requires_resolved_documents(field: str) -> None:
-    from rpent.context import assemble_context
+    from rpent.data_convert import convert_planner_input
 
-    with pytest.raises(TypeError, match=f"{field} entries must be ContextDocument"):
-        assemble_context(prompt="rules", query="task", **{field: ["file.md"]})
+    with pytest.raises(TypeError, match=f"{field} entries must be TextDocument"):
+        convert_planner_input(prompt="rules", query="task", **{field: ["file.md"]})

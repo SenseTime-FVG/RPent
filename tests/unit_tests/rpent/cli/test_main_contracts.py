@@ -642,9 +642,11 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
     )
 
 
+@pytest.mark.parametrize("runtime_model", [False, True])
 def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    runtime_model: bool,
 ) -> None:
     cli = _cli_module()
     from rpent.evaluation import RunFinalizationContext, write_json_atomic
@@ -722,6 +724,11 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     monkeypatch.setattr(cli, "get_robot_spec", lambda name: robot_spec)
     monkeypatch.setattr(cli, "build_planner", lambda *args, **kwargs: FakePlanner())
     monkeypatch.setattr(cli, "get_toolkit", lambda *args, **kwargs: robot_toolkit)
+    runtime_path = tmp_path / "runtime.yaml"
+    runtime_path.write_text(
+        'llm: {provider: openai, model: configured-model}\ntrace: {mode: "off"}\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -734,9 +741,12 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
             "--seed",
             "1",
             "--planner",
-            "codex",
-            "--model",
-            "gpt-5.5",
+            "api" if runtime_model else "codex",
+            *(
+                ["--runtime-config", str(runtime_path)]
+                if runtime_model
+                else ["--model", "gpt-5.5"]
+            ),
             "--reasoning-effort",
             "xhigh",
             "--planner-timeout-s",
@@ -757,8 +767,11 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     assert context.robot_name == "testrobot"
     assert context.environment_success is False
     assert context.agent_error is None
-    assert context.planner == "codex"
-    assert context.model == "gpt-5.5"
+    assert context.planner == ("api" if runtime_model else "codex")
+    expected_model = "openai:configured-model" if runtime_model else "gpt-5.5"
+    assert context.model == expected_model
+    transcript = json.loads((tmp_path / "transcript_OpenDrawer_s1.json").read_text())
+    assert transcript["model"] == expected_model
     assert context.reasoning_effort == "xhigh"
     assert context.max_turns == 100
     assert context.planner_timeout_s == 1800

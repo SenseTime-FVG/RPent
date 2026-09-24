@@ -74,7 +74,7 @@ def setup(tmp_path, monkeypatch):
     env = FakeEnv()
     replies = []
     toolkit = DualFrankaToolkit(
-        runtime_kwargs={"env": env, "model": None, "task_description": "test"},
+        runtime_kwargs={"env": env, "model": object(), "task_description": "test"},
         dashboard_events=NullDashboardEventSink(),
         memory=MemoryManager(
             tmp_path / "memory",

@@ -79,7 +79,7 @@ def configure(experiment: Path, repo: Path, key_file: Path, deps: Path) -> None:
     # The source launcher shares its XDG cache between all workers. Warp can
     # read a partially compiled module when several shards start together.
     # Give each shard its own kernel cache while retaining shared dependencies.
-    cache_root = '${CACHE_ROOT}'
+    cache_root = "${CACHE_ROOT}"
     _replace(
         worker,
         'export XDG_CACHE_HOME="${RP_ONCE_CACHE_ROOT}/xdg/isaaclab232"',

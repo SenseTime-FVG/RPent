@@ -193,6 +193,7 @@ class Toolkit:
             tuple[dict[str, Any], Callable[..., Any]],
         ] = {}
         self._dashboard_events = dashboard_events
+        self.capture_video = False
         self._state = state
         self._memory = memory
         self._operation_lock = threading.Lock()

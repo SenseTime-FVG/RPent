@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -309,6 +310,14 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
     )
 
     assert error is None
+    trace_manifests = list(
+        (output_dir / "sessions").glob("session_*/trace/manifest.json")
+    )
+    assert len(trace_manifests) == sessions
+    assert all(
+        json.loads(path.read_text())["status"] == "completed"
+        for path in trace_manifests
+    )
     assert planner_calls[0]["user_message"] == "user\n"
     assert [call["system_prompt"] for call in planner_calls] == [
         f"system for session {number}\n" for number in range(1, sessions + 1)

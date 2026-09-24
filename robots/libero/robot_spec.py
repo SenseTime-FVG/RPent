@@ -141,6 +141,7 @@ def get_toolkit(
     runtime_kwargs: dict[str, Any],
     dashboard_events: DashboardEventSink,
     config: RunConfig,
+    enable_vla: bool = True,
     mode: str = "evaluation",
     attempts_per_session: int = 0,
     state_output_dir: Path | str | None = None,
@@ -155,6 +156,7 @@ def get_toolkit(
         inbox_cell_tag=config.recipe_tag if explore else None,
     )
     return LiberoToolkit(
+        enable_vla=enable_vla,
         runtime_kwargs=runtime_kwargs,
         dashboard_events=dashboard_events,
         memory=memory,
@@ -265,6 +267,8 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         raise ValueError("--task is required")
     planner = getattr(args, "planner", None)
     if planner == "flash":
+        if not getattr(args, "enable_vla", True):
+            raise ValueError("--planner flash requires VLA; remove --no-vla")
         if getattr(args, "explore", False):
             raise ValueError("Flash Mode is evaluation-only; remove --explore")
         if args.suite not in FLASH_SUITES:
@@ -321,6 +325,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
                 "run exploration first or use --memory-profile hf"
             )
     prompt_vars = {
+        "enable_vla": getattr(args, "enable_vla", True),
         "suite": args.suite,
         "task": args.task,
         "seed": args.seed,
@@ -514,6 +519,11 @@ def _init_runtime(
         "molmo": lambda rpc: {"molmo_client": MolmoClient(rpc)},
     }
     selected = set(starters) if components is None else set(components)
+    enable_vla = getattr(args, "enable_vla", True)
+    if not enable_vla:
+        if getattr(args, "planner", None) == "flash":
+            raise ValueError("--planner flash requires VLA; remove --no-vla")
+        selected.discard("vla")
     if getattr(args, "planner", None) != "flash":
         selected.discard("molmo")
     unknown = selected.difference(starters)
@@ -532,6 +542,8 @@ def _init_runtime(
             )
 
     runtime_kwargs: dict[str, Any] = {}
+    if not enable_vla:
+        runtime_kwargs["model"] = None
     wait_order = ("env", "sam3", "molmo", "vla")
     for component in (name for name in wait_order if name in pending):
         daemon, rpc = pending[component]

@@ -166,18 +166,18 @@ predicate for evaluation.
 Selected memory and initial observations
 ----------------------------------------------------
 
-Pass already selected memory excerpts with ``memory``. Each ``ContextDocument``
+Pass already selected memory excerpts with ``memory``. Each ``TextDocument``
 retains a title, text, and optional source identifier:
 
 .. code-block:: python
 
-   from rpent.context import ContextDocument
+   from rpent.data_convert import TextDocument
 
    result = agent.run(
        "Place the red block in the bowl.",
        system_prompt="Use the registered robot tools and inspect each result.",
        skills=["benchmark/SKILL.md"],
-       memory=[ContextDocument(
+       memory=[TextDocument(
            title="Top grasp",
            text="Approach this object from above; recheck its current pose.",
            source="memory/grasp.md",
@@ -194,7 +194,7 @@ unchanged.
 objects for the ``api`` planner. These parts follow the task and selected memory
 in their supplied order, preserving image bytes and metadata. Other planners do
 not accept this argument. Skills, memory, and observations use the same
-``rpent.context.assemble_context`` function as CLI and Dashboard runs; see
+``rpent.data_convert.convert_planner_input`` function as CLI and Dashboard runs; see
 :ref:`planner-context` for direct use of the structured bundle.
 
 Configured delegates
@@ -224,11 +224,17 @@ Alternatively, use ``runtime=RuntimeConfig.from_file("benchmark/runtime.yaml")``
 Skill paths in Python configuration follow the caller's working directory; file
 configuration resolves them relative to that file. Children receive explicit
 delegation text rather than the parent's conversation or initial observations.
-Remote MCP action tools remain on the parent. Only the existing artifact/text
-readers can be selected for children, and a reader must exist in the supplied
-catalog. See :ref:`planner-runtime` for tool restrictions, model selection,
+Remote MCP action tools remain on the parent. Children can select existing
+artifact/text readers from the supplied catalog and ``read_skill`` backed by
+their own explicit skill directories. See :ref:`planner-runtime` for tool restrictions, model selection,
 shared usage, and CLI/Dashboard configuration. Other planners reject ``runtime``
 before opening MCP connections.
+
+Context policies, on-demand skills, full model configuration and live/offline
+trajectory inspection are described in :doc:`agent_runtime`. These single-agent
+features do not require the ``runtime`` extra. Existing ``skills`` file arguments
+still preload full text; ``runtime.skill_paths`` instead exposes a lazy directory
+catalog. Input-conversion migration names are listed in the same guide.
 
 RoboDojo example
 ----------------
