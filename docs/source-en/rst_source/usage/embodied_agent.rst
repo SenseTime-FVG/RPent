@@ -83,9 +83,15 @@ configure it with ``LLMConfig(retry=RetryPolicy(max_retries=...))``. HTTP 400,
 401, 403, and other permanent failures are logged and returned immediately.
 Each failed provider attempt writes a sanitized record to
 ``<output_dir>/llm_errors.jsonl`` for the ``api`` planner. The record includes
-the status, attempt number, and retry decision, without prompts, response
-bodies, or API keys. For direct calls, pass ``log_path`` to ``LLMClient`` to
-save the same records to a file. Errors still propagate from direct calls;
+the status, attempt number, retry decision, and request shape. Every attempt,
+including successful ones, is also written to ``llm_requests.jsonl`` in the
+same directory. Its request ID links retries; it records message and image
+counts, text length, image bytes, cache points, tool schema length, latency,
+and provider token usage when available. These sizes help investigate failed
+requests; they are not token counts for requests without provider usage.
+Neither log stores prompts, images, response bodies, or API keys. For direct
+calls, pass ``log_path`` to ``LLMClient`` to save the error records at that
+path and request records beside it. Errors still propagate from direct calls;
 ``EmbodiedAgent.run`` returns them in ``PlannerResult.error``.
 
 Skill files are read and inserted into the prompt on every run; they are not
