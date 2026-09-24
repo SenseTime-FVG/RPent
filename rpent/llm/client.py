@@ -20,7 +20,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from rpent.llm.retry import RetryLoggingModel, RetryPolicy
 from rpent.utils.logging import get_logger
@@ -34,6 +34,48 @@ OpenAIFormat = Literal["responses", "chat"]
 PromptCacheMode = Literal["implicit", "explicit"]
 
 logger = get_logger("llm.client")
+OMITTED_HISTORY_IMAGE_TEXT = "[earlier camera image omitted to bound request size]"
+
+
+def _mark_recent_function_outputs(input_items: list[dict[str, Any]]) -> None:
+    """Match the Responses wire breakpoints used by the RoboProbe example."""
+    outputs = [
+        item
+        for item in input_items
+        if item.get("type") == "function_call_output"
+        and isinstance(item.get("output"), str)
+    ]
+    for item in outputs[-40:]:
+        item["output"] = [
+            {
+                "type": "input_text",
+                "text": item["output"],
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }
+        ]
+
+
+def _mark_text_before_images(input_items: list[dict[str, Any]]) -> None:
+    """Cache the text prefix before each camera image or its later placeholder.
+
+    Older observations are replaced with text as the image window advances.
+    Keep the marker on each label after replacement so the next request can
+    still match the prefix that ended immediately before the former image.
+    """
+    for item in input_items:
+        if item.get("role") != "user" or not isinstance(item.get("content"), list):
+            continue
+        content = item["content"]
+        for index in range(1, len(content)):
+            part = content[index]
+            if part.get("type") != "input_image" and not (
+                part.get("type") == "input_text"
+                and part.get("text") == OMITTED_HISTORY_IMAGE_TEXT
+            ):
+                continue
+            previous = content[index - 1]
+            if previous.get("type") == "input_text":
+                previous["prompt_cache_breakpoint"] = {"mode": "explicit"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +95,8 @@ class LLMConfig:
     prompt_cache_key: str | None = None
     prompt_cache_mode: PromptCacheMode | None = None
     image_history_groups: int | None = None
+    preserve_initial_image_count: int = 0
+    parallel_tool_calls: bool | None = None
     retry: RetryPolicy = field(default_factory=RetryPolicy)
 
     def __post_init__(self) -> None:
@@ -74,6 +118,10 @@ class LLMConfig:
             raise ValueError("unsupported prompt cache mode")
         if self.image_history_groups is not None and self.image_history_groups < 1:
             raise ValueError("image_history_groups must be positive")
+        if self.preserve_initial_image_count < 0:
+            raise ValueError("preserve_initial_image_count must be non-negative")
+        if self.parallel_tool_calls is not None and self.provider != "openai":
+            raise ValueError("parallel_tool_calls requires an OpenAI provider")
 
     def build_model(self) -> Model:
         """Construct the selected Pydantic AI model without changing process env."""
@@ -90,17 +138,41 @@ class LLMConfig:
 
         from pydantic_ai.models.openai import (
             OpenAIChatModel,
+            OpenAIChatModelSettings,
             OpenAIResponsesModel,
             OpenAIResponsesModelSettings,
         )
         from pydantic_ai.providers.openai import OpenAIProvider
 
         provider = OpenAIProvider(api_key=self.api_key, base_url=self.base_url)
-        model_cls = (
-            OpenAIChatModel if self.openai_format == "chat" else OpenAIResponsesModel
-        )
-        if model_cls is OpenAIResponsesModel and (
-            self.prompt_cache_key is not None or self.prompt_cache_mode is not None
+        if self.openai_format == "chat":
+            if self.parallel_tool_calls is None:
+                return OpenAIChatModel(self.model, provider=provider)
+            return OpenAIChatModel(
+                self.model,
+                provider=provider,
+                settings=OpenAIChatModelSettings(
+                    parallel_tool_calls=self.parallel_tool_calls
+                ),
+            )
+
+        model_cls = OpenAIResponsesModel
+        if self.prompt_cache_mode == "explicit":
+
+            class ExplicitCacheResponsesModel(OpenAIResponsesModel):
+                async def _map_messages(self, *args: Any, **kwargs: Any) -> Any:
+                    instructions, input_items = await super()._map_messages(
+                        *args, **kwargs
+                    )
+                    _mark_recent_function_outputs(input_items)
+                    _mark_text_before_images(input_items)
+                    return instructions, input_items
+
+            model_cls = ExplicitCacheResponsesModel
+        if (
+            self.prompt_cache_key is not None
+            or self.prompt_cache_mode is not None
+            or self.parallel_tool_calls is not None
         ):
             settings = OpenAIResponsesModelSettings()
             if self.prompt_cache_key is not None:
@@ -109,6 +181,8 @@ class LLMConfig:
                 settings["openai_prompt_cache_options"] = {
                     "mode": self.prompt_cache_mode
                 }
+            if self.parallel_tool_calls is not None:
+                settings["parallel_tool_calls"] = self.parallel_tool_calls
             return model_cls(self.model, provider=provider, settings=settings)
         return model_cls(self.model, provider=provider)
 
@@ -240,7 +314,11 @@ def build_model_settings(model: Model, max_tokens: int):
         )
     cache_settings = {
         key: value
-        for key in ("openai_prompt_cache_key", "openai_prompt_cache_options")
+        for key in (
+            "openai_prompt_cache_key",
+            "openai_prompt_cache_options",
+            "parallel_tool_calls",
+        )
         if (value := (underlying.settings or {}).get(key)) is not None
     }
     return ModelSettings(max_tokens=max_tokens, **cache_settings)

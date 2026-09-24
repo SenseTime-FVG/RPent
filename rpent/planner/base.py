@@ -184,6 +184,8 @@ def build_planner(
     dashboard_events: DashboardEventSink,
     no_images: bool = False,
     runtime: RuntimeConfig | None = None,
+    include_image_reader: bool = True,
+    require_tool_call: bool = False,
 ):
     """Build a planner for the given backend, resolving credentials from env vars."""
     # Imports are deferred to avoid a circular import: api_loop / claude_code /
@@ -225,6 +227,11 @@ def build_planner(
                 llm_config.image_history_groups if llm_config is not None else None
             ),
             runtime=runtime,
+            preserve_initial_image_count=(
+                llm_config.preserve_initial_image_count if llm_config is not None else 0
+            ),
+            include_image_reader=include_image_reader,
+            require_tool_call=require_tool_call,
         )
     if planner_type == "claude_code":
         from rpent.planner.claude_code import ClaudeCodePlanner

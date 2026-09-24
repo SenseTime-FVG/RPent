@@ -40,12 +40,63 @@ passed back to the model. Return camera frames as MCP image content when the
 model must see pixels; a text path or URL remains text. Include the task,
 coordinate frame, action limits, and observation rules in the supplied context;
 RPent does not assume a fixed ``move_eef`` or ``snapshot`` schema.
+Set ``McpServer(expose_unprefixed=True)`` for a single server when the model
+must see the tool's original name, such as ``move_eef``. Tool names must remain
+unique across all connected servers.
 
 For a local stdio server, pass ``command`` and optional ``args``, ``env``, and
 ``cwd`` instead of ``url``. Exactly one of ``url`` or ``command`` is required
 per server. Multiple servers may be supplied, with unique names. A stdio
-server is launched and closed for every call to ``run``. Use a distinct
+server inherits the parent process environment, with ``env`` values overriding
+individual variables. It is launched and closed for every ``run`` or
+``start_episode``. Use a distinct
 ``output_dir`` for each episode.
+
+When the benchmark's simulator exists only in its current process, use a
+persistent episode. The MCP server still supplies the tool schema; the named
+tools are executed by the benchmark thread after RPent hands back each call.
+Complete a motion only after the environment has stepped and captured a fresh
+observation. ``ToolResult`` accepts image bytes through its image fields or
+through MCP-style ``content_blocks``. The benchmark decides when the episode
+ends and reads its own native score.
+
+.. code-block:: python
+
+   from rpent.tools.toolkit import ToolResult
+
+   with agent.start_episode(
+       "Place the block.",
+       system_prompt="Use robot__move_eef to command world-frame poses.",
+       deferred_tools=["robot__move_eef"],
+       initial_context=["Initial state: ..."],
+   ) as episode:
+       while (call := episode.next_call(timeout=300)) is not None:
+           observation = benchmark.execute_and_observe(call.arguments)
+           episode.complete(
+               call,
+               ToolResult(call.name, {
+                   "state": observation.state,
+                   "_image_bytes": observation.camera_png,
+                   "_finish": observation.episode_done,
+               }),
+           )
+           if observation.episode_done:
+               break
+       result = episode.wait(timeout=300)
+   native_score = benchmark.read_native_score()
+
+The ``api`` planner supports deferred tools. ``start_episode`` holds one model
+conversation across all physical actions, so each accepted ``move_eef`` normally
+uses one model response. A tool result with ``_finish: true`` ends that
+conversation without another model call. ``EmbodiedEpisode.close`` releases a
+pending call when a benchmark ends unexpectedly. For a separate MCP process
+that owns the robot or camera connection, use ``run`` and implement tool
+execution directly in that server.
+
+``rpent.evaluation.embodied.evaluate_cases`` accepts independent benchmark and
+agent factories, runs separate cases concurrently, and records the benchmark's
+native ``success`` and ``score``. Each case needs its own simulator instance;
+RoboDojo uses a separate GPU worker for each shard.
 
 Supported planners are ``api``, ``claude_code``, and ``codex``. ``LLMConfig``
 works with the ``api`` planner and supports ``provider="openai"`` or
@@ -57,10 +108,15 @@ arguments remain available as described in :doc:`configure_planner`.
 
 For a Responses endpoint that supports explicit prompt caching, set
 ``prompt_cache_key`` to a stable value and ``prompt_cache_mode="explicit"`` in
-``LLMConfig``. RPent marks the initial task and multimodal tool feedback as
-cache breakpoints. Set ``image_history_groups=2`` to retain the last two
+``LLMConfig``. RPent marks the task text and the latest 40 Responses
+``function_call_output`` texts as cache breakpoints. Set
+``image_history_groups=2`` to retain the last two
 observation groups; older camera images become text placeholders. These
 options are opt-in because compatible endpoints may not support them.
+``preserve_initial_image_count=N`` keeps the first N demonstration images in the initial
+request unchanged across turns while ``image_history_groups`` applies to later
+observations. Set ``parallel_tool_calls=False`` when the robot expects one
+action per model response.
 Calculate the provider-reported cache hit rate as
 ``cache_read_tokens / input_tokens`` over completed requests. The input count
 already includes cached tokens.
@@ -83,9 +139,22 @@ configure it with ``LLMConfig(retry=RetryPolicy(max_retries=...))``. HTTP 400,
 401, 403, and other permanent failures are logged and returned immediately.
 Each failed provider attempt writes a sanitized record to
 ``<output_dir>/llm_errors.jsonl`` for the ``api`` planner. The record includes
-the status, attempt number, and retry decision, without prompts, response
-bodies, or API keys. For direct calls, pass ``log_path`` to ``LLMClient`` to
-save the same records to a file. Errors still propagate from direct calls;
+the status, attempt number, retry decision, and request shape. Every attempt,
+including successful ones, is also written to ``llm_requests.jsonl`` in the
+same directory. Its request ID links retries; it records message and image
+counts, text length, image bytes, cache points, tool schema length, latency,
+and provider token usage when available. These sizes help investigate failed
+requests; they are not token counts for requests without provider usage.
+For HTTP failures, logs also include the server error code/type, selected
+request ID headers, and a SHA-256 fingerprint of the response body.
+``llm_errors.jsonl`` records the response body for every failed attempt,
+including HTTP 400 and 500. Fields that can contain echoed prompts, images,
+or credentials are redacted. When the provider returned no body, the record
+says ``available: false`` and includes the exception message. Error files are
+written with owner-only permissions. ``llm_requests.jsonl`` stores request
+shape and usage without response bodies. For direct calls, pass ``log_path``
+to ``LLMClient`` to save the error records at that path and request records
+beside it. Errors still propagate from direct calls;
 ``EmbodiedAgent.run`` returns them in ``PlannerResult.error``.
 
 Skill files are read and inserted into the prompt on every run; they are not
@@ -163,6 +232,18 @@ before opening MCP connections.
 
 RoboDojo example
 ----------------
+
+The EEF example in ``examples/robodojo/eef_episode_policy.py`` runs RoboProbe's
+Cartesian action and CuRobo planning logic through a single RPent episode.
+Its MCP ``move_eef`` result contains the post-action robot state and three RGB
+cameras. ``install_eef_episode.py`` places this user-owned policy beside the
+reference policy in a fresh RoboDojo workspace; ``configure_eef_experiment.py``
+adapts the existing parallel launcher. ``cache_gate_eef.py`` replays recorded
+RGB observations through the same RPent request path and requires a token
+weighted provider cache hit rate above 60% before benchmark submission.
+RoboDojo supplies the native task score.
+
+The earlier discrete-action example remains available:
 
 ``examples/robodojo`` contains an XPolicyLab bridge that uses ``EmbodiedAgent``
 for RoboDojo decisions. Its ``snapshot`` MCP tool supplies camera frames and

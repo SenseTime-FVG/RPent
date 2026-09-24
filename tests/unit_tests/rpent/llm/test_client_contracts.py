@@ -25,15 +25,23 @@ from typing import Any
 import pytest
 from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
-from pydantic_ai.messages import CachePoint, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    CachePoint,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage, RunUsage
 
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.llm import LLMClient, LLMConfig, LLMUsage, RetryPolicy
-from rpent.llm.client import build_model_settings
+from rpent.llm.client import _mark_recent_function_outputs, build_model_settings
 from rpent.llm.retry import RetryLoggingModel
-from rpent.planner.api_loop import _build_stats
+from rpent.planner.api_loop import _build_stats, _prune_history_images
 from rpent.planner.base import build_planner
 
 
@@ -79,26 +87,124 @@ def test_responses_explicit_cache_settings_and_breakpoint_wire_format() -> None:
         prompt_cache_key="robodojo-stable-v1",
         prompt_cache_mode="explicit",
         image_history_groups=2,
+        parallel_tool_calls=False,
     )
     model = config.build_model()
+    assert type(model).__name__ == "ExplicitCacheResponsesModel"
     settings = build_model_settings(model, 128)
     assert settings["openai_prompt_cache_key"] == "robodojo-stable-v1"
     assert settings["openai_prompt_cache_options"] == {"mode": "explicit"}
+    assert settings["parallel_tool_calls"] is False
     mapped = asyncio.run(
         model._map_user_prompt(UserPromptPart(content=["stable goal", CachePoint()]))
     )
     assert mapped["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
-    image = asyncio.run(
-        model._map_user_prompt(
-            UserPromptPart(
-                content=[
-                    BinaryContent(data=b"jpeg", media_type="image/jpeg"),
-                    CachePoint(),
-                ]
-            )
+    _, wire = asyncio.run(
+        model._map_messages(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content=["stable goal", CachePoint()])]
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name="move_eef",
+                            content="new robot state",
+                            tool_call_id="call-1",
+                        )
+                    ]
+                ),
+            ],
+            settings,
+            ModelRequestParameters(),
         )
     )
-    assert image["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert wire[1]["output"] == [
+        {
+            "type": "input_text",
+            "text": "new robot state",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }
+    ]
+    outputs = [
+        {"type": "function_call_output", "call_id": str(index), "output": str(index)}
+        for index in range(42)
+    ]
+    _mark_recent_function_outputs(outputs)
+    assert outputs[0]["output"] == "0"
+    assert outputs[1]["output"] == "1"
+    assert outputs[2]["output"] == [
+        {
+            "type": "input_text",
+            "text": "2",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }
+    ]
+
+
+def test_explicit_cache_keeps_breakpoint_when_old_image_ages_out() -> None:
+    model = LLMConfig(
+        "openai",
+        "gpt-6-astra/azure_L/qwb",
+        api_key="test",
+        prompt_cache_mode="explicit",
+        image_history_groups=2,
+    ).build_model()
+    settings = build_model_settings(model, 128)
+    messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=[
+                        "stable goal",
+                        CachePoint(),
+                        "demonstration camera:",
+                        BinaryContent(data=b"demonstration", media_type="image/jpeg"),
+                        "camera 0:",
+                        BinaryContent(data=b"frame-0", media_type="image/jpeg"),
+                    ]
+                )
+            ]
+        ),
+        *(
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=[
+                            f"camera {index}:",
+                            BinaryContent(
+                                data=f"frame-{index}".encode(),
+                                media_type="image/jpeg",
+                            ),
+                        ]
+                    )
+                ]
+            )
+            for index in range(1, 4)
+        ),
+    ]
+    _, before = asyncio.run(
+        model._map_messages(messages, settings, ModelRequestParameters())
+    )
+    pruned = _prune_history_images(
+        messages, max_groups=2, preserve_initial_image_count=1
+    )
+    _, after = asyncio.run(
+        model._map_messages(pruned, settings, ModelRequestParameters())
+    )
+
+    # The marker remains on each camera label when its image becomes a stub.
+    for index in range(4):
+        label_before = before[index]["content"][-2]
+        label_after = after[index]["content"][-2]
+        assert label_before == label_after
+        assert label_after["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert after[0]["content"][1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert after[0]["content"][2]["type"] == "input_image"
+    assert after[0]["content"][-1]["type"] == "input_text"
+    assert after[1]["content"][-1]["type"] == "input_text"
+    assert after[2]["content"][-1]["type"] == "input_image"
+    assert after[3]["content"][-1]["type"] == "input_image"
 
 
 def test_prompt_cache_configuration_rejects_incompatible_endpoints() -> None:
@@ -208,8 +314,29 @@ def test_http_failures_have_bounded_retries_and_sanitized_logs(
         False,
     ]
     assert all(record["status_code"] == status for record in records)
+    assert all(
+        record["response_body"]["body"] == {"prompt": "[redacted]"}
+        for record in records
+    )
+    assert (log_path.stat().st_mode & 0o777) == 0o600
     assert "private text" not in log_path.read_text()
     assert "secret-key" not in log_path.read_text()
+    request_records = [
+        json.loads(line)
+        for line in (tmp_path / "llm_requests.jsonl").read_text().splitlines()
+    ]
+    assert len(request_records) == expected_attempts
+    assert {record["request_id"] for record in request_records} == {
+        request_records[0]["request_id"]
+    }
+    assert [record["attempt"] for record in request_records] == list(
+        range(1, expected_attempts + 1)
+    )
+    assert all(record["status_code"] == status for record in request_records)
+    assert all(record["request_shape"]["text_chars"] > 0 for record in request_records)
+    request_log = (tmp_path / "llm_requests.jsonl").read_text()
+    assert "private text" not in request_log
+    assert "secret-key" not in request_log
 
 
 def test_transient_failure_recovers_without_replaying_completed_request(
@@ -243,6 +370,93 @@ def test_transient_failure_recovers_without_replaying_completed_request(
     assert result.text == "recovered"
     assert result.usage.requests == 1
     assert len(log_path.read_text().splitlines()) == 1
+    request_records = [
+        json.loads(line)
+        for line in (tmp_path / "llm_requests.jsonl").read_text().splitlines()
+    ]
+    assert [record["outcome"] for record in request_records] == ["error", "success"]
+    assert request_records[1]["usage"]["input_tokens"] == 4
+    assert request_records[1]["usage"]["output_tokens"] == 2
+
+
+def test_failed_multimodal_request_logs_only_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        raise ModelHTTPError(500, "offline", body={"prompt": "private text"})
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+    client = LLMClient(
+        LLMConfig(
+            "openai",
+            "offline",
+            api_key="secret-key",
+            retry=RetryPolicy(max_retries=0),
+        ),
+        log_path=tmp_path / "llm_errors.jsonl",
+    )
+    with pytest.raises(ModelHTTPError):
+        client._agent("private instruction", 128).run_sync(
+            [
+                "private text",
+                BinaryContent(data=b"jpeg-secret", media_type="image/jpeg"),
+            ]
+        )
+    record = json.loads((tmp_path / "llm_requests.jsonl").read_text().splitlines()[0])
+    assert record["status_code"] == 500
+    assert record["request_shape"]["image_count"] == 1
+    assert record["request_shape"]["image_bytes"] == len(b"jpeg-secret")
+    assert record["request_shape"]["text_chars"] >= len("private text") + len(
+        "private instruction"
+    )
+    assert record["request_shape"]["max_output_tokens"] == 128
+    log = (tmp_path / "llm_requests.jsonl").read_text()
+    assert "private text" not in log
+    assert "private instruction" not in log
+    assert "jpeg-secret" not in log
+    assert "secret-key" not in log
+
+
+def test_http_500_logs_server_body_with_redaction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        raise ModelHTTPError(
+            500,
+            "offline",
+            body={
+                "error": {
+                    "code": "server_error",
+                    "type": "upstream_timeout",
+                    "message": "Internal Server Error: upstream timed out",
+                    "prompt": "private task text",
+                }
+            },
+            headers={"x-request-id": "request-123", "authorization": "secret-key"},
+        )
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+    client = LLMClient(
+        LLMConfig(
+            "openai", "offline", api_key="secret-key", retry=RetryPolicy(max_retries=0)
+        ),
+        log_path=tmp_path / "llm_errors.jsonl",
+    )
+    with pytest.raises(ModelHTTPError):
+        client.generate_sync("private task text")
+    record = json.loads((tmp_path / "llm_errors.jsonl").read_text().splitlines()[0])
+    assert record["server_error"]["code"] == "server_error"
+    assert record["server_error"]["type"] == "upstream_timeout"
+    assert record["server_error"]["x_request_id"] == "request-123"
+    assert (
+        record["server_error"]["message"] == "Internal Server Error: upstream timed out"
+    )
+    assert len(record["server_error"]["body_sha256"]) == 64
+    assert record["response_body"]["available"] is True
+    assert record["response_body"]["body"]["error"]["code"] == "server_error"
+    assert record["response_body"]["body"]["error"]["prompt"] == "[redacted]"
+    assert "private task text" not in (tmp_path / "llm_errors.jsonl").read_text()
+    assert "secret-key" not in (tmp_path / "llm_requests.jsonl").read_text()
 
 
 @pytest.mark.parametrize(
@@ -276,6 +490,10 @@ def test_non_http_failures_are_logged_and_only_connection_errors_retry(
     with pytest.raises(type(error)):
         client.generate_sync("task")
     assert attempts == expected_attempts
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert all("response_body" in record for record in records)
+    if isinstance(error, ModelAPIError):
+        assert all(record["response_body"]["available"] is False for record in records)
     assert len(log_path.read_text().splitlines()) == expected_attempts
 
 

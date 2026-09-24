@@ -20,7 +20,9 @@ import asyncio
 import inspect
 import json
 import os
+import queue
 import threading
+import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -46,7 +48,8 @@ class McpServer:
     """Connection to a user-owned Streamable HTTP or stdio MCP server.
 
     Exactly one of ``url`` and ``command`` must be set. A stdio server is
-    started for each :meth:`EmbodiedAgent.run` and stopped when it returns.
+    started for each :meth:`EmbodiedAgent.run` or
+    :meth:`EmbodiedAgent.start_episode` and stopped when it ends.
     """
 
     name: str
@@ -56,6 +59,7 @@ class McpServer:
     env: Mapping[str, str] | None = None
     cwd: str | None = None
     headers: Mapping[str, str] | None = None
+    expose_unprefixed: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.replace("_", "").isalnum():
@@ -73,10 +77,122 @@ class _RemoteTool:
     spec: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class PendingToolCall:
+    """A model tool call awaiting execution by the benchmark owner."""
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _PendingResponse:
+    call: PendingToolCall
+    ready: threading.Event = field(default_factory=threading.Event)
+    result: ToolResult | None = None
+
+
+class _ToolBridge:
+    """Hand selected MCP calls to the thread that owns the environment."""
+
+    def __init__(self) -> None:
+        self.calls: queue.Queue[PendingToolCall | None] = queue.Queue()
+        self._pending: dict[str, _PendingResponse] = {}
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        call = PendingToolCall(uuid.uuid4().hex, name, dict(arguments))
+        pending = _PendingResponse(call)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("embodied episode is closed")
+            self._pending[call.call_id] = pending
+        self.calls.put(call)
+        pending.ready.wait()
+        with self._lock:
+            self._pending.pop(call.call_id, None)
+        if pending.result is None:
+            raise RuntimeError("embodied episode closed before tool completion")
+        return pending.result
+
+    def respond(self, call: PendingToolCall, result: ToolResult) -> None:
+        with self._lock:
+            pending = self._pending.get(call.call_id)
+            if pending is None or pending.call != call or pending.ready.is_set():
+                raise ValueError("unknown or already completed embodied tool call")
+            if result.name != call.name:
+                raise ValueError("tool result name does not match pending call")
+            pending.result = result
+            pending.ready.set()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for pending in self._pending.values():
+                pending.ready.set()
+        self.calls.put(None)
+
+
+class EmbodiedEpisode:
+    """Run an agent while the benchmark executes selected tool calls."""
+
+    def __init__(self, bridge: _ToolBridge, worker: threading.Thread) -> None:
+        self._bridge = bridge
+        self._worker = worker
+        self._result: PlannerResult | None = None
+        self._error: BaseException | None = None
+        self._done = threading.Event()
+
+    def next_call(self, timeout: float | None = None) -> PendingToolCall | None:
+        """Wait for a tool call, or return ``None`` after the episode ends."""
+        try:
+            return self._bridge.calls.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError("no embodied tool call before timeout") from None
+
+    def complete(self, call: PendingToolCall, result: ToolResult) -> None:
+        """Return an executed tool result, including any camera content blocks."""
+        self._bridge.respond(call, result)
+
+    def wait(self, timeout: float | None = None) -> PlannerResult:
+        """Wait for the planner result, propagating startup failures."""
+        if not self._done.wait(timeout):
+            raise TimeoutError("embodied episode did not finish before timeout")
+        if self._error is not None:
+            raise RuntimeError("embodied episode failed") from self._error
+        assert self._result is not None
+        return self._result
+
+    def close(self) -> None:
+        """Release a blocked tool call and wait for the agent to clean up."""
+        self._bridge.close()
+        self._worker.join(timeout=5)
+        if self._worker.is_alive():
+            logger.warning("embodied episode worker is still stopping")
+
+    def __enter__(self) -> EmbodiedEpisode:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
 class _McpToolkit:
     """Adapt MCP discovery and calls to the planner's toolkit contract."""
 
-    def __init__(self, servers: Sequence[McpServer], output_dir: Path):
+    def __init__(
+        self,
+        servers: Sequence[McpServer],
+        output_dir: Path,
+        *,
+        bridge: _ToolBridge | None = None,
+        deferred_tools: Sequence[str] = (),
+        include_finish: bool = True,
+    ):
         self.state = EnvState(output_dir)
         self._servers = tuple(servers)
         self._sessions: dict[str, Any] = {}
@@ -87,6 +203,9 @@ class _McpToolkit:
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
         self._call_lock = threading.Lock()
+        self._bridge = bridge
+        self._deferred_tools = frozenset(deferred_tools)
+        self._include_finish = include_finish
 
     async def _serve(self) -> None:
         from mcp import ClientSession, StdioServerParameters
@@ -124,9 +243,7 @@ class _McpToolkit:
                         params = StdioServerParameters(
                             command=server.command,
                             args=list(server.args),
-                            env={**os.environ, **server.env}
-                            if server.env is not None
-                            else None,
+                            env={**os.environ, **(server.env or {})},
                             cwd=server.cwd,
                         )
                         read, write = await stack.enter_async_context(
@@ -138,7 +255,11 @@ class _McpToolkit:
                     await session.initialize()
                     self._sessions[server.name] = session
                     for tool in (await session.list_tools()).tools:
-                        public_name = f"{server.name}__{tool.name}"
+                        public_name = (
+                            tool.name
+                            if server.expose_unprefixed
+                            else f"{server.name}__{tool.name}"
+                        )
                         if public_name in self._tools or public_name == "finish":
                             raise ValueError(f"duplicate MCP tool: {public_name}")
                         self._tools[public_name] = _RemoteTool(
@@ -171,10 +292,17 @@ class _McpToolkit:
         if self._startup_error is not None:
             self.close()
             raise RuntimeError("failed to start MCP tools") from self._startup_error
+        unknown = self._deferred_tools.difference(self._tools)
+        if unknown:
+            self.close()
+            raise ValueError(f"unknown deferred MCP tools: {sorted(unknown)}")
 
     def get_tools_spec(self) -> list[dict[str, Any]]:
         """Return remote tool schemas and a local completion tool."""
-        return [tool.spec for tool in self._tools.values()] + [
+        tools = [tool.spec for tool in self._tools.values()]
+        if not self._include_finish:
+            return tools
+        return tools + [
             {
                 "name": "finish",
                 "description": "Report your conclusion. Benchmark success is judged by the environment.",
@@ -198,7 +326,7 @@ class _McpToolkit:
 
     def execute_tool(self, name: str, input_dict: dict[str, Any]) -> ToolResult:
         """Call one remote tool while preserving its MCP text and image blocks."""
-        if name == "finish":
+        if name == "finish" and self._include_finish:
             status = input_dict.get("status")
             summary = input_dict.get("summary")
             if status not in {"success", "failure", "stuck"} or not isinstance(
@@ -214,6 +342,9 @@ class _McpToolkit:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(name=name, result={"error": f"unknown tool: {name}"})
+        if name in self._deferred_tools:
+            assert self._bridge is not None
+            return self._bridge.execute(name, input_dict)
         with self._call_lock:
             if self._loop is None:
                 raise RuntimeError("MCP toolkit is closed")
@@ -276,6 +407,8 @@ class _McpToolkit:
 
     def close(self) -> None:
         """Close owned MCP sessions after outstanding calls finish."""
+        if self._bridge is not None:
+            self._bridge.close()
         with self._call_lock:
             if self._loop is not None and self._stop is not None:
                 self._loop.call_soon_threadsafe(self._stop.set)
@@ -339,6 +472,74 @@ class EmbodiedAgent:
             RPent's planner result. Its ``finish_result`` is self-reported;
             callers must use the benchmark's own success signal for scoring.
         """
+        return self._run(
+            task,
+            system_prompt=system_prompt,
+            skills=skills,
+            memory=memory,
+            initial_context=initial_context,
+            output_dir=output_dir,
+        )
+
+    def start_episode(
+        self,
+        task: str,
+        *,
+        system_prompt: str,
+        deferred_tools: Sequence[str],
+        skills: Sequence[str | Path] = (),
+        memory: Sequence[ContextDocument] = (),
+        initial_context: Sequence[str | BinaryContent] = (),
+        output_dir: str | Path | None = None,
+        include_finish: bool = False,
+    ) -> EmbodiedEpisode:
+        """Start one persistent run with benchmark-executed MCP tools."""
+        if not deferred_tools:
+            raise ValueError("start_episode requires at least one deferred tool")
+        if self.planner != "api":
+            raise ValueError("deferred tool episodes require the api planner")
+        bridge = _ToolBridge()
+        episode: EmbodiedEpisode
+
+        def run_worker() -> None:
+            try:
+                episode._result = self._run(
+                    task,
+                    system_prompt=system_prompt,
+                    skills=skills,
+                    memory=memory,
+                    initial_context=initial_context,
+                    output_dir=output_dir,
+                    bridge=bridge,
+                    deferred_tools=deferred_tools,
+                    include_finish=include_finish,
+                )
+            except BaseException as exc:
+                episode._error = exc
+            finally:
+                bridge.close()
+                episode._done.set()
+
+        worker = threading.Thread(
+            target=run_worker, name="embodied-episode", daemon=True
+        )
+        episode = EmbodiedEpisode(bridge, worker)
+        worker.start()
+        return episode
+
+    def _run(
+        self,
+        task: str,
+        *,
+        system_prompt: str,
+        skills: Sequence[str | Path],
+        initial_context: Sequence[str | BinaryContent],
+        output_dir: str | Path | None,
+        memory: Sequence[ContextDocument] = (),
+        bridge: _ToolBridge | None = None,
+        deferred_tools: Sequence[str] = (),
+        include_finish: bool = True,
+    ) -> PlannerResult:
         if self.planner not in {"api", "claude_code", "codex"}:
             raise ValueError(f"unsupported embodied planner: {self.planner}")
         if self.runtime is not None and self.planner != "api":
@@ -371,7 +572,13 @@ class EmbodiedAgent:
         output.mkdir(parents=True, exist_ok=True)
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("EmbodiedAgent already has an active episode")
-        toolkit = _McpToolkit(self.mcp_servers, output)
+        toolkit = _McpToolkit(
+            self.mcp_servers,
+            output,
+            bridge=bridge,
+            deferred_tools=deferred_tools,
+            include_finish=include_finish,
+        )
         try:
             toolkit.start()
             planner = build_planner(
@@ -387,6 +594,8 @@ class EmbodiedAgent:
                 reasoning_effort=self.reasoning_effort,
                 dashboard_events=NullDashboardEventSink(),
                 runtime=self.runtime,
+                include_image_reader=False,
+                require_tool_call=bridge is not None,
             )
             result = planner.solve(
                 system_prompt=context.system_prompt,
