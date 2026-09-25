@@ -4,18 +4,33 @@
 
 ## 设计原则
 
-用户通过 `system_prompt`、`skills`、`tools/MCP` 和 `context_engine` 配置 Agent，benchmark 提供任务详情与工具执行所需的环境。
-Agent 通过 `context_engine` 组织每次 LLM 调用的上下文，按 `task -> llm_response -> tool_call -> tool_response -> llm_response -> ... -> task finished` 完成任务。
-RPent 已定义统一的训练数据标准，Dataset 将 Agent 记录的每次 LLM 调用输入与输出整理为标准训练集。
+用户通过 `system_prompt`、`skills`、`tools/MCP` 和 `context_engine` 配置 Agent，各模块协作如下。
 
 ```text
-[user: system_prompt, skills, tools/MCP, context_engine] --> [Agent]
-[benchmark: task/env] -- task details ------------------> [Agent]
-[Agent] <----------- per-call LLM context --------------> [context_engine]
-[Agent] -- tool_call --> [tools/MCP] -- action ----------> [benchmark: task/env]
-[benchmark: task/env] -- observation --> [tools/MCP] -- tool_response --> [Agent]
-[Agent] -- each LLM input/output --> [Dataset] -- standard format --> [training set]
+user config: system_prompt / skills / tools/MCP / context_engine
+                            |
+                            v
++-----------+   task    +-------+  per-call context  +----------------+
+| benchmark | --------> | Agent | <----------------> | context_engine |
+| task/env  |           +---+---+                    +----------------+
++-----^-----+               | ^
+      |           tool_call | | tool_response
+      |                     v |
+      +-- execute/observe +-----------+
+                         | tools/MCP |
+                         +-----------+
+
+Agent -- LLM I/O --> Dataset -- standard format --> training set
+
+task -> llm_response -> tool_call -> tool_response
+     -> llm_response -> ... -> task finished
 ```
+
+**Benchmark**：提供任务详情和工具执行所需的环境。
+
+**Agent**：通过 `context_engine` 组织每次 LLM 调用的上下文。
+
+**Dataset**：将 Agent 记录的每次 LLM 输入与输出整理为标准训练集格式。
 
 ## 用户接口
 
