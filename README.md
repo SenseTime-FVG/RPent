@@ -1,3 +1,6 @@
+本项目已经Archived, 新版本见NewRPent
+
+
 # 统一 Agent 接口与训练数据
 
 原项目介绍与安装说明：[中文](README.zh-CN.md) · [English](README_old.md)。
