@@ -40,7 +40,6 @@ def install(experiment: Path) -> Path:
     for src, dest in (
         ("eef_episode_policy.py", "policy.py"),
         ("eef_episode_deploy.py", "deploy.py"),
-        ("eef_episode_mcp.py", "mcp_schema.py"),
     ):
         shutil.copy2(examples / src, target / dest)
     config = target / "deploy.yml"

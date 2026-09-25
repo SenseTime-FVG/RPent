@@ -85,6 +85,7 @@
 
    Agentic Planner <rst_source/usage/configure_planner>
    EmbodiedAgent <rst_source/usage/embodied_agent>
+   统一 Agent 与训练数据 <rst_source/usage/unified_agent>
    Agent Runtime 与轨迹 <rst_source/usage/agent_runtime>
    动作原语 <rst_source/usage/configure_primitives>
    数据飞轮 <rst_source/usage/flywheel>

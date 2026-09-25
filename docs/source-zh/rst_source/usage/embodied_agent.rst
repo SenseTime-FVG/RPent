@@ -3,8 +3,9 @@ EmbodiedAgent：接入外部 MCP Benchmark
 
 ``EmbodiedAgent`` 将 RPent 现有的 planner 循环提供给 benchmark 使用，无需在
 ``robots/`` 下新增机器人包。benchmark 负责重置 episode、执行机器人动作、采集
-观测以及判定任务成功。用户把动作和观测实现为 MCP 服务，提供 system prompt 和
-可选的 skill 文件，然后对每个 episode 调用一次 ``run``。
+观测以及判定任务成功。用户可通过 MCP 服务或 ``LocalToolSpec`` 提供工具，
+再提供 system prompt 和可选 skill。以下是 MCP 示例；本进程工具、逐题
+``skill_paths`` 和训练数据导出见 :doc:`unified_agent`。
 
 .. code-block:: python
 
@@ -116,7 +117,7 @@ Completions 的端点可设 ``openai_format="chat"``。原有 ``model`` 和
 
 LLM 请求遇到 HTTP 408、409、425、429、5xx，或没有 HTTP 状态码的
 提供商 API、连接错误时会重试。
-默认最多重试两次，并使用有上限的指数退避；可通过
+默认在首次请求后最多重试三次，并使用有上限的指数退避；可通过
 ``LLMConfig(retry=RetryPolicy(max_retries=...))`` 调整。HTTP 400、401、
 403 等永久性错误会记录并立即返回。``api`` planner 每次失败的请求都会向
 ``<output_dir>/llm_errors.jsonl`` 写入状态码、尝试次数、重试决定和请求体量。

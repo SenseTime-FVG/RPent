@@ -23,12 +23,12 @@ from typing import Any
 
 import pytest
 from pydantic_ai import BinaryContent
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from rpent.data_convert import TextDocument
-from rpent.embodied_agent import EmbodiedAgent, McpServer
+from rpent.embodied_agent import EmbodiedAgent, LocalToolSpec, McpServer
 from rpent.llm import LLMConfig
 from rpent.planner.base import PlannerResult
 from rpent.planner.utils.http_mcp_server import HttpMcpServer
@@ -358,6 +358,125 @@ def test_episode_hands_motion_to_benchmark_and_returns_observation(
     assert result.finish_result["status"] == "native_end"
     assert result.stats["requests"] == 2
     assert robot.calls == []
+
+
+def test_local_tool_runs_without_mcp_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        assert {tool.name for tool in info.function_tools} == {"move_eef", "finish"}
+        if calls:
+            return ModelResponse(
+                parts=[ToolCallPart("finish", {"status": "success", "summary": "done"})]
+            )
+        return ModelResponse(parts=[ToolCallPart("move_eef", {"x": 0.2})])
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+
+    def move(arguments: dict[str, Any]) -> ToolResult:
+        calls.append(arguments)
+        return ToolResult("move_eef", {"state": "arrived", "_image_bytes": b"png"})
+
+    agent = EmbodiedAgent(
+        mcp_servers=[],
+        local_tools=[
+            LocalToolSpec(
+                "move_eef",
+                "Move the end effector.",
+                {"type": "object", "properties": {"x": {"type": "number"}}},
+                handler=move,
+            )
+        ],
+        output_dir=tmp_path / "episode",
+        llm=LLMConfig("openai", "offline", api_key="test"),
+    )
+    result = agent.run("Move the block.", system_prompt="Use move_eef.")
+    assert calls == [{"x": 0.2}]
+    assert result.finish_result is not None
+    assert result.error is None
+
+
+def test_local_tool_defers_to_benchmark_thread_without_mcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart("move_eef", {"x": 0.2})])
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+    agent = EmbodiedAgent(
+        mcp_servers=[],
+        local_tools=[
+            LocalToolSpec(
+                "move_eef",
+                "Move the end effector.",
+                {"type": "object", "properties": {"x": {"type": "number"}}},
+            )
+        ],
+        output_dir=tmp_path / "episode",
+        llm=LLMConfig("openai", "offline", api_key="test"),
+    )
+    with agent.start_episode(
+        "Move the block.",
+        system_prompt="Use move_eef.",
+        deferred_tools=["move_eef"],
+    ) as episode:
+        call = episode.next_call(timeout=10)
+        assert call is not None
+        assert call.arguments == {"x": 0.2}
+        episode.complete(call, ToolResult("move_eef", {"_finish": True}))
+        assert episode.wait(timeout=10).finish_result == {"_finish": True}
+
+
+def test_task_selected_skills_change_without_rebuilding_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("pick", "place"):
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "SKILL.md").write_text(f"{name} instructions", encoding="utf-8")
+    seen: list[str] = []
+
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        name = "pick" if "- pick:" in info.instructions else "place"
+        assert f"- {name}:" in info.instructions
+        assert f"- {'place' if name == 'pick' else 'pick'}:" not in info.instructions
+        if any(
+            isinstance(part, ToolReturnPart)
+            for message in messages
+            for part in message.parts
+        ):
+            seen.append(name)
+            return ModelResponse(
+                parts=[ToolCallPart("finish", {"status": "success", "summary": name})]
+            )
+        return ModelResponse(parts=[ToolCallPart("read_skill", {"name": name})])
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: FunctionModel(model))
+    agent = EmbodiedAgent(
+        mcp_servers=[],
+        local_tools=[
+            LocalToolSpec(
+                "observe",
+                "Read state",
+                {"type": "object", "properties": {}},
+                handler=lambda _: ToolResult("observe", {"state": "ok"}),
+            )
+        ],
+        output_dir=tmp_path / "unused",
+        llm=LLMConfig("openai", "offline", api_key="test"),
+    )
+    for name in ("pick", "place"):
+        result = agent.run(
+            "Do the task.",
+            system_prompt="Use skills.",
+            skill_paths=[tmp_path / name],
+            output_dir=tmp_path / f"run-{name}",
+        )
+        assert result.finish_result["summary"] == name
+        assert (tmp_path / f"run-{name}" / "trace/manifest.json").exists()
+    assert seen == ["pick", "place"]
 
 
 def test_embodied_agent_rejects_invalid_server_config(tmp_path: Path) -> None:

@@ -93,6 +93,7 @@ Welcome to RPent
 
    Agentic Planner <rst_source/usage/configure_planner>
    EmbodiedAgent <rst_source/usage/embodied_agent>
+   Unified Agent and Training Data <rst_source/usage/unified_agent>
    Agent Runtime and Trajectories <rst_source/usage/agent_runtime>
    Action Primitives <rst_source/usage/configure_primitives>
    Data Flywheel <rst_source/usage/flywheel>

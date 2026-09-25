@@ -17,15 +17,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import os
 import queue
 import threading
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,40 @@ class McpServer:
             if len(self.tools) != len(set(self.tools)):
                 raise ValueError("MCP tool names must be unique")
             object.__setattr__(self, "tools", tuple(self.tools))
+
+
+@dataclass(frozen=True, slots=True)
+class LocalToolSpec:
+    """Benchmark-owned tool schema, optionally executed in this process.
+
+    Without a handler, the tool must be named in ``start_episode``'s
+    ``deferred_tools`` so the benchmark can execute it on its environment thread.
+    """
+
+    name: str
+    description: str
+    input_schema: Mapping[str, Any]
+    handler: Callable[[dict[str, Any]], ToolResult] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.name, str)
+            or not self.name
+            or not self.name.replace("_", "").isalnum()
+            or self.name == "finish"
+        ):
+            raise ValueError(
+                "local tool name must contain only letters, digits, or _ and cannot be finish"
+            )
+        if not isinstance(self.description, str):
+            raise TypeError("local tool description must be text")
+        if not isinstance(self.input_schema, Mapping):
+            raise TypeError("local tool input_schema must be a mapping")
+        if self.handler is not None and not callable(self.handler):
+            raise TypeError("local tool handler must be callable")
+        from jsonschema import Draft202012Validator
+
+        Draft202012Validator.check_schema(self.input_schema)
 
 
 @dataclass(slots=True)
@@ -200,12 +235,16 @@ class _McpToolkit:
         servers: Sequence[McpServer],
         output_dir: Path,
         *,
+        local_tools: Sequence[LocalToolSpec] = (),
         bridge: _ToolBridge | None = None,
         deferred_tools: Sequence[str] = (),
         include_finish: bool = True,
     ):
         self.state = EnvState(output_dir)
         self._servers = tuple(servers)
+        self._local_tools = {tool.name: tool for tool in local_tools}
+        if len(self._local_tools) != len(local_tools):
+            raise ValueError("local tool names must be unique")
         self._sessions: dict[str, Any] = {}
         self._tools: dict[str, _RemoteTool] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -280,7 +319,11 @@ class _McpToolkit:
                             if server.expose_unprefixed
                             else f"{server.name}__{tool.name}"
                         )
-                        if public_name in self._tools or public_name == "finish":
+                        if (
+                            public_name in self._tools
+                            or public_name in self._local_tools
+                            or public_name == "finish"
+                        ):
                             raise ValueError(f"duplicate MCP tool: {public_name}")
                         self._tools[public_name] = _RemoteTool(
                             server=server.name,
@@ -304,6 +347,9 @@ class _McpToolkit:
         """Connect to every MCP server and discover its tools."""
         if self._thread is not None:
             raise RuntimeError("MCP toolkit is already started")
+        if not self._servers:
+            self._validate_local_tools()
+            return
         self._thread = threading.Thread(
             target=lambda: asyncio.run(self._serve()), name="embodied-mcp", daemon=True
         )
@@ -312,14 +358,37 @@ class _McpToolkit:
         if self._startup_error is not None:
             self.close()
             raise RuntimeError("failed to start MCP tools") from self._startup_error
-        unknown = self._deferred_tools.difference(self._tools)
-        if unknown:
+        try:
+            self._validate_local_tools()
+        except ValueError:
             self.close()
-            raise ValueError(f"unknown deferred MCP tools: {sorted(unknown)}")
+            raise
+
+    def _validate_local_tools(self) -> None:
+        unknown = self._deferred_tools.difference(
+            self._tools.keys() | self._local_tools.keys()
+        )
+        if unknown:
+            raise ValueError(f"unknown deferred tools: {sorted(unknown)}")
+        missing = [
+            name
+            for name, tool in self._local_tools.items()
+            if tool.handler is None and name not in self._deferred_tools
+        ]
+        if missing:
+            raise ValueError(f"local tools need handlers or deferral: {missing}")
 
     def get_tools_spec(self) -> list[dict[str, Any]]:
         """Return remote tool schemas and a local completion tool."""
         tools = [tool.spec for tool in self._tools.values()]
+        tools.extend(
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": copy.deepcopy(tool.input_schema),
+            }
+            for tool in self._local_tools.values()
+        )
         if not self._include_finish:
             return tools
         return tools + [
@@ -359,12 +428,22 @@ class _McpToolkit:
                 name=name,
                 result={"_finish": True, "status": status, "summary": summary},
             )
-        tool = self._tools.get(name)
-        if tool is None:
-            return ToolResult(name=name, result={"error": f"unknown tool: {name}"})
         if name in self._deferred_tools:
             assert self._bridge is not None
             return self._bridge.execute(name, input_dict)
+        local = self._local_tools.get(name)
+        if local is not None:
+            assert local.handler is not None
+            try:
+                result = local.handler(input_dict)
+            except Exception as exc:
+                return ToolResult(name=name, result={"error": str(exc)})
+            if not isinstance(result, ToolResult) or result.name != name:
+                raise ValueError(f"local tool {name} must return a matching ToolResult")
+            return result
+        tool = self._tools.get(name)
+        if tool is None:
+            return ToolResult(name=name, result={"error": f"unknown tool: {name}"})
         with self._call_lock:
             if self._loop is None:
                 raise RuntimeError("MCP toolkit is closed")
@@ -412,6 +491,10 @@ class _McpToolkit:
         )
         if response.isError:
             result_dict.setdefault("error", "MCP tool failed")
+        if not any(block["type"] == "text" for block in blocks):
+            blocks.insert(
+                0, {"type": "text", "text": json.dumps(result_dict, ensure_ascii=False)}
+            )
         result = ToolResult(
             name=name,
             result=result_dict,
@@ -440,7 +523,7 @@ class _McpToolkit:
 
 @dataclass(slots=True)
 class EmbodiedAgent:
-    """Run RPent with benchmark-provided instructions and MCP robot tools.
+    """Run RPent with benchmark instructions and local or MCP robot tools.
 
     Construct once per evaluation configuration, then call :meth:`run` for
     each episode. The benchmark owns reset, success checks, and scoring.
@@ -450,6 +533,7 @@ class EmbodiedAgent:
 
     mcp_servers: Sequence[McpServer]
     output_dir: str | Path
+    local_tools: Sequence[LocalToolSpec] = ()
     planner: str = "api"
     model: str | None = None
     base_url: str | None = None
@@ -469,6 +553,7 @@ class EmbodiedAgent:
         *,
         system_prompt: str,
         skills: Sequence[str | Path] = (),
+        skill_paths: Sequence[str | Path] = (),
         memory: Sequence[TextDocument] = (),
         initial_context: Sequence[str | BinaryContent] = (),
         output_dir: str | Path | None = None,
@@ -480,6 +565,8 @@ class EmbodiedAgent:
             system_prompt: Benchmark and robot-specific rules.
             skills: Paths to skill Markdown files. Each file is read fresh for
                 this episode, so task-specific files can change between runs.
+            skill_paths: Task-specific skill directories indexed for on-demand
+                read_skill calls; combined with runtime.skill_paths.
             memory: Selected, authorized memory excerpts with optional source
                 identifiers. Appended to the task as reference context, not
                 system instructions. No memory files are read automatically.
@@ -496,6 +583,7 @@ class EmbodiedAgent:
             task,
             system_prompt=system_prompt,
             skills=skills,
+            skill_paths=skill_paths,
             memory=memory,
             initial_context=initial_context,
             output_dir=output_dir,
@@ -508,6 +596,7 @@ class EmbodiedAgent:
         system_prompt: str,
         deferred_tools: Sequence[str],
         skills: Sequence[str | Path] = (),
+        skill_paths: Sequence[str | Path] = (),
         memory: Sequence[TextDocument] = (),
         initial_context: Sequence[str | BinaryContent] = (),
         output_dir: str | Path | None = None,
@@ -527,6 +616,7 @@ class EmbodiedAgent:
                     task,
                     system_prompt=system_prompt,
                     skills=skills,
+                    skill_paths=skill_paths,
                     memory=memory,
                     initial_context=initial_context,
                     output_dir=output_dir,
@@ -553,6 +643,7 @@ class EmbodiedAgent:
         *,
         system_prompt: str,
         skills: Sequence[str | Path],
+        skill_paths: Sequence[str | Path],
         initial_context: Sequence[str | BinaryContent],
         output_dir: str | Path | None,
         memory: Sequence[TextDocument] = (),
@@ -562,11 +653,19 @@ class EmbodiedAgent:
     ) -> PlannerResult:
         if self.planner not in {"api", "claude_code", "codex"}:
             raise ValueError(f"unsupported embodied planner: {self.planner}")
-        if self.runtime is not None and self.planner != "api":
+        runtime = self.runtime
+        if skill_paths:
+            if self.planner != "api":
+                raise ValueError("on-demand skill_paths require the api planner")
+            runtime = replace(
+                runtime or RuntimeConfig(),
+                skill_paths=(*(runtime.skill_paths if runtime else ()), *skill_paths),
+            )
+        if runtime is not None and self.planner != "api":
             raise ValueError("runtime is supported only by the api planner")
-        if self.runtime is not None:
-            self.runtime.validate_resources()
-            if self.runtime.llm is not None and (
+        if runtime is not None:
+            runtime.validate_resources()
+            if runtime.llm is not None and (
                 self.llm is not None
                 or self.model is not None
                 or self.base_url is not None
@@ -580,8 +679,8 @@ class EmbodiedAgent:
             self.model is not None or self.base_url is not None
         ):
             raise ValueError("pass either llm or model/base_url")
-        if not self.mcp_servers:
-            raise ValueError("at least one MCP server is required")
+        if not self.mcp_servers and not self.local_tools:
+            raise ValueError("at least one MCP server or local tool is required")
         names = [server.name for server in self.mcp_servers]
         if len(names) != len(set(names)):
             raise ValueError("MCP server names must be unique")
@@ -603,6 +702,7 @@ class EmbodiedAgent:
         toolkit = _McpToolkit(
             self.mcp_servers,
             output,
+            local_tools=self.local_tools,
             bridge=bridge,
             deferred_tools=deferred_tools,
             include_finish=include_finish,
@@ -622,12 +722,12 @@ class EmbodiedAgent:
                 planner_timeout_s=self.planner_timeout_s,
                 reasoning_effort=self.reasoning_effort,
                 dashboard_events=NullDashboardEventSink(),
-                runtime=self.runtime,
+                runtime=runtime,
                 include_image_reader=False,
                 require_tool_call=bridge is not None,
             )
             trace = create_trace(
-                output, self.runtime, NullDashboardEventSink(), toolkit=toolkit
+                output, runtime, NullDashboardEventSink(), toolkit=toolkit
             )
             toolkit.start()
             with activate_trace(trace):
