@@ -4,16 +4,18 @@
 
 ## 设计原则
 
-RPent 负责 VLM/LLM 的逐轮请求、工具调度、context、skill、重试和轨迹采集；
-benchmark 负责重置环境、执行动作、返回观测和原生评分。一个 episode 的典型
-流程是 `任务 -> 模型回复/工具调用 -> 环境执行并返回状态与图像 -> 下一次模型请求`，
-直到环境结束、agent 调用 `finish` 或达到预算。模型自报的 `finish` 状态
-不能代替 benchmark 的成功判定。
+用户通过 `system_prompt`、`skills`、`tools/MCP` 和 `context_engine` 配置 Agent，benchmark 提供任务详情与工具执行所需的环境。
+Agent 通过 `context_engine` 组织每次 LLM 调用的上下文，按 `task -> llm_response -> tool_call -> tool_response -> llm_response -> ... -> task finished` 完成任务。
+RPent 已定义统一的训练数据标准，Dataset 将 Agent 记录的每次 LLM 调用输入与输出整理为标准训练集。
 
-每次模型请求都以当时实际发送的 system instructions、消息、工具 schema 和
-模型设置为准。Context engine 默认保留历史；用户可在每次请求前改写历史消息。
-它不改变固定的 system instructions 或工具权限。一次逻辑模型请求可能包含
-多次网络 attempt；训练数据应保留 attempt 信息，但只产生一个调用记录。
+```text
+[user: system_prompt, skills, tools/MCP, context_engine] --> [Agent]
+[benchmark: task/env] -- task details ------------------> [Agent]
+[Agent] <----------- per-call LLM context --------------> [context_engine]
+[Agent] -- tool_call --> [tools/MCP] -- action ----------> [benchmark: task/env]
+[benchmark: task/env] -- observation --> [tools/MCP] -- tool_response --> [Agent]
+[Agent] -- each LLM input/output --> [Dataset] -- standard format --> [training set]
+```
 
 ## 用户接口
 
