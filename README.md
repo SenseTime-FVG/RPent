@@ -4,31 +4,30 @@
 
 ## 设计原则
 
-**入口**：用户配置 `system_prompt`、`skills`、`tools/MCP` 和 `context_engine`，benchmark 提供任务详情和执行环境。
+用户通过 `system_prompt`、`skills`、`tools/MCP` 和 `context_engine` 配置 Agent，各模块协作如下。
 
-**执行**：Agent 通过 `context_engine` 组织每次 LLM 调用的上下文，在模型回复、工具执行和环境反馈之间循环，直到任务结束。
-
-**数据**：Dataset 将 Agent 记录的每次 LLM 调用输入与输出整理为统一的训练数据格式。
-
-```text
-user config: system_prompt / skills / tools/MCP / context_engine
-                            |
-                            v
-+-----------+   task    +-------+  per-call context  +----------------+
-| benchmark | --------> | Agent | <----------------> | context_engine |
-| task/env  |           +---+---+                    +----------------+
-+-----^-----+               | ^
-      |           tool_call | | tool_response
-      |                     v |
-      +-- execute/observe +-----------+
-                         | tools/MCP |
-                         +-----------+
-
-Agent -- LLM I/O --> Dataset -- standard format --> training set
-
-task -> llm_response -> tool_call -> tool_response
-     -> llm_response -> ... -> task finished
+```mermaid
+flowchart LR
+    U["用户配置"] --> A["Agent"]
+    B["Benchmark"] -->|任务详情| A
+    A -->|组织每次 LLM 上下文| C["context_engine"]
+    C -->|调用上下文| A
+    A -->|请求| L["LLM"]
+    L -->|llm_response| A
+    A -->|tool_call| T["tools/MCP"]
+    T -->|执行动作| B
+    B -->|状态与图像| T
+    T -->|tool_response| A
+    A -->|task finished| F["结束"]
+    A -->|导出逐次 LLM 输入与输出| D["Dataset"]
+    D --> S["标准训练集"]
 ```
+
+**Benchmark**：提供任务详情和工具执行所需的环境。
+
+**Agent**：通过 `context_engine` 组织每次 LLM 调用的上下文。
+
+**Dataset**：将 Agent 记录的每次 LLM 输入与输出整理为标准训练集格式。
 
 ## 用户接口
 
