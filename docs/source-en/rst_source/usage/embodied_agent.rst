@@ -3,9 +3,10 @@ EmbodiedAgent: external MCP benchmarks
 
 ``EmbodiedAgent`` exposes RPent's existing planner loop to a benchmark without
 requiring a robot package under ``robots/``. The benchmark owns episode reset,
-robot actions, observation capture, and success scoring. It exposes actions and
-observations through an MCP server, supplies a system prompt and optional skill
-files, then calls ``run`` once per episode.
+robot actions, observation capture, and success scoring. Tools may come from
+an MCP service or ``LocalToolSpec``. This page starts with MCP; see
+:doc:`unified_agent` for in-process tools, per-task ``skill_paths``, and training
+data export.
 
 .. code-block:: python
 
@@ -133,7 +134,7 @@ and ``generate_sync``. Each response has ``text`` and ``usage``; the client also
 exposes cumulative ``total_usage``.
 
 LLM requests retry HTTP 408, 409, 425, 429, and 5xx responses, plus provider
-API or connection errors without an HTTP status. The default is two retries
+API or connection errors without an HTTP status. The default is three retries
 with capped exponential backoff;
 configure it with ``LLMConfig(retry=RetryPolicy(max_retries=...))``. HTTP 400,
 401, 403, and other permanent failures are logged and returned immediately.

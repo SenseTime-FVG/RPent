@@ -22,8 +22,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
-import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -36,11 +34,12 @@ from XPolicyLab.policy.RoboDojo_Agent_L3_Inspect_EEF.policy import EefAgentPolic
 from rpent.embodied_agent import (
     EmbodiedAgent,
     EmbodiedEpisode,
-    McpServer,
+    LocalToolSpec,
     PendingToolCall,
 )
 from rpent.evaluation.result import write_json_atomic
 from rpent.llm import LLMConfig
+from rpent.runtime import RuntimeConfig
 from rpent.tools.toolkit import ToolResult
 
 
@@ -116,6 +115,7 @@ class EmbodiedEefPolicy(EefAgentPolicy):
         self._pending_request_id: str | None = None
         self._played = 0
         self._started_at: float | None = None
+        self._task_instruction: str | None = None
         self._artifact_dir = Path(kwargs["env"]["L3_INSPECT_TRACE_DIR"]) / "rpent"
         # A single provider call may consume the SDK read timeout on each of
         # three HTTP attempts. Keep the tool bridge open while those retries
@@ -131,8 +131,6 @@ class EmbodiedEefPolicy(EefAgentPolicy):
         self._started_at = time.monotonic()
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
         specs = [item["function"] for item in self._tools]
-        schema_path = self._artifact_dir / "eef_tools.json"
-        schema_path.write_text(json.dumps(specs), encoding="utf-8")
         context: list[str | BinaryContent] = []
         # The goal is passed separately as the task. Only demonstration
         # images are protected; the first live observation ages out.
@@ -149,18 +147,14 @@ class EmbodiedEefPolicy(EefAgentPolicy):
             context.extend(parts)
         model = self._env.get("L3_INSPECT_MODEL", "gpt-6-astra/azure_L/qwb")
         agent = EmbodiedAgent(
-            mcp_servers=[
-                McpServer(
-                    name="dojo",
-                    expose_unprefixed=True,
-                    command=sys.executable,
-                    args=(
-                        "-m",
-                        "XPolicyLab.policy.RoboDojo_EmbodiedAgent_EEF.mcp_schema",
-                        str(schema_path),
-                    ),
-                    env={"PYTHONPATH": os.environ.get("PYTHONPATH", "")},
+            mcp_servers=[],
+            local_tools=[
+                LocalToolSpec(
+                    name=item["name"],
+                    description=item["description"],
+                    input_schema=item["parameters"],
                 )
+                for item in specs
             ],
             output_dir=self._artifact_dir,
             llm=LLMConfig(
@@ -180,9 +174,13 @@ class EmbodiedEefPolicy(EefAgentPolicy):
             max_tokens=int(self._env.get("L3_INSPECT_MAX_TOKENS", "8000")),
             planner_timeout_s=10800,
             reasoning_effort=self._env.get("L3_INSPECT_REASONING_EFFORT", "medium"),
+            runtime=RuntimeConfig(),
+        )
+        self._task_instruction = (
+            self._goal_text or f"Goal: {observation.instruction or ''}"
         )
         self._episode = agent.start_episode(
-            self._goal_text or f"Goal: {observation.instruction or ''}",
+            self._task_instruction,
             system_prompt=self._system_message(),
             initial_context=context,
             deferred_tools=[item["name"] for item in specs],
@@ -367,6 +365,7 @@ class EmbodiedEefPolicy(EefAgentPolicy):
             self._artifact_dir / "episode.json",
             {
                 "task": self._task_name,
+                "instruction": self._task_instruction,
                 "model": self._env.get("L3_INSPECT_MODEL"),
                 "requests": self._calls,
                 "input_tokens": input_tokens,

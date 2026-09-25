@@ -4,7 +4,7 @@
 
 The new ``RoboDojo_EmbodiedAgent_EEF`` user policy keeps RoboProbe's
 ``move_eef`` parsing and CuRobo trajectory planner. RPent owns one continuous
-LLM conversation per episode. The ``move_eef`` MCP call is handed to the
+LLM conversation per episode. The ``move_eef`` local tool call is handed to the
 RoboDojo client process; its tool result is returned only after Isaac executes
 the planned action and supplies a fresh robot state and three RGB views.
 RoboDojo owns task termination and native scoring. This policy uses one model
@@ -12,8 +12,13 @@ response per accepted action, plus requests needed to repair rejected actions.
 
 Prepare a fresh workspace with the existing ``roboprobe_once/prepare.py``,
 then configure the EEF user demo. The runtime dependency directory must
-contain ``mcp`` and ``pydantic_ai`` for Python 3.11. Keep the model key outside
+contain ``pydantic_ai``, ``jsonschema``, and ``yaml`` for Python 3.11. Keep the model key outside
 Git; the configurator copies it into the experiment with mode ``0600``.
+
+```bash
+python3.11 -m pip install --target /path/to/python-dependencies \
+  'pydantic-ai-slim[openai]>=2.1' 'jsonschema>=4.18' 'PyYAML>=6'
+```
 
 ```bash
 python roboprobe_once/prepare.py --experiment /path/to/new-experiment
@@ -34,7 +39,7 @@ the provider reports a token-weighted cache hit rate above 60%. After the
 gate and a bounded real task check, use the prepared ``manage.py`` to create
 and submit separate GPU shards, for example ``plan --jobs 16``. The manager
 keeps one native scored seed-0/layout-0 episode per task, and stores RPent
-usage and retry logs under each task trace's ``rpent`` directory. This
+full model/tool traces, usage, and retry logs under each task trace's ``rpent`` directory. This
 54-task coverage run is distinct from RoboDojo's official multi-seed leaderboard.
 Each shard gets its own Warp, Torch, and CUDA compilation caches so parallel
 workers cannot read partially written kernels. The policy waits up to 2,100
@@ -44,6 +49,29 @@ After scoring, run ``manage.py status`` and ``report_eef.py --experiment
 /path/to/new-experiment``. The report joins each native result to the same
 run's RPent request log and reports per-task calls, retries, tokens, and cache
 hit rate, plus the call-count median and P75.
+
+After native scoring, export standard agent training episodes with:
+
+```bash
+python RPent/examples/robodojo/export_training.py \
+  --experiment /path/to/scored-experiment \
+  --output-root /path/to/training-data \
+  --dataset-id robodojo-eef --dataset-version 2026-09.v1 \
+  --split train --seed 0 --benchmark-version 2026-09 \
+  --versions-file /path/to/versions.json \
+  --exporter-commit abc123 --seal
+```
+
+The exporter joins RoboDojo's native success and score with each run's full
+RPent trace. It writes a versioned dataset manifest and keeps every logical
+LLM request, response, tool result, retry attempt, and referenced image in
+the format described in
+[`Unified Agent and Training Data`](../../docs/source-en/rst_source/usage/unified_agent.rst).
+The versions file is a JSON object with collection-time keys such as
+`agent_commit`, `simulator`, `scorer`, `prompt`, and `skills`; omit unknown keys.
+Replace `abc123` with the exporter's actual commit.
+Use `--successful-only` to select native successes. Older runs without full
+trace and the recorded task instruction cannot be exported.
 
 ## Discrete-action RoboDawn example
 

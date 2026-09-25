@@ -115,6 +115,8 @@ To evaluate RPent with a benchmark that exposes robot actions and camera
 observations as MCP tools, use the Python
 [`EmbodiedAgent` entry point](docs/source-en/rst_source/usage/embodied_agent.rst).
 It accepts benchmark instructions through a system prompt and skill files.
+For in-process tools, task-selected skills, context engines, and cross-benchmark
+training conversion, see [Unified Agent and Training Data](docs/source-en/rst_source/usage/unified_agent.rst).
 
 **1. Choose an environment and install RPent.**
 

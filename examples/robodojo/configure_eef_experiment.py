@@ -38,7 +38,9 @@ def _replace(path: Path, before: str, after: str) -> None:
 def configure(experiment: Path, repo: Path, key_file: Path, deps: Path) -> None:
     if not (repo / "rpent/embodied_agent.py").is_file():
         raise FileNotFoundError("RPent checkout is missing")
-    if not (deps / "mcp").is_dir() or not (deps / "pydantic_ai").is_dir():
+    if any(
+        not (deps / name).is_dir() for name in ("pydantic_ai", "jsonschema", "yaml")
+    ):
         raise FileNotFoundError("RPent runtime dependencies are missing")
     if not key_file.is_file():
         raise FileNotFoundError("model key file is missing")

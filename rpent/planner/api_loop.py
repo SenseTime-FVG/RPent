@@ -501,7 +501,7 @@ class _ApiRunObserver:
     turns: int = 0
     tool_calls: int = 0
     finish_result: dict[str, Any] | None = None
-    pending_finish: dict[str, Any] | None = None
+    pending_finish: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def observe_response(
         self,
@@ -540,8 +540,8 @@ class _ApiRunObserver:
                     {"type": "tool_call", "tool": part.tool_name, "args": args}
                 )
             )
-            if part.tool_name == "finish":
-                self.pending_finish = {"_finish": True, **args}
+            if part.tool_name == "finish" and part.tool_call_id is not None:
+                self.pending_finish[part.tool_call_id] = {"_finish": True, **args}
         elif isinstance(event, FunctionToolResultEvent):
             completed = True
             message = _serialize_tool_result(event)
@@ -556,10 +556,16 @@ class _ApiRunObserver:
                     terminal = None
                 if isinstance(terminal, dict) and terminal.get("_finish") is True:
                     self.finish_result = terminal
-            if self.pending_finish is not None:
-                if not is_error and "finish refused" not in str(message):
-                    self.finish_result = self.pending_finish
-                self.pending_finish = None
+            pending = self.pending_finish.pop(message["tool_call_id"], None)
+            if (
+                pending is not None
+                and not is_error
+                and not (isinstance(terminal, dict) and terminal.get("error"))
+                and "finish refused" not in message["content"]
+            ):
+                self.finish_result = (
+                    pending if self.finish_result is None else self.finish_result
+                )
             self.dashboard_events.emit(
                 TranscriptEvent(
                     {

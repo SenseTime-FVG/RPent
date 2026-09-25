@@ -178,6 +178,7 @@ exclude = ["tests*", "docs*", "examples*", "docker*", "toolkits*"]
 
 [tool.setuptools.package-data]
 "rpent.dashboard" = ["*.html", "static/*.css", "static/*.js"]
+"rpent.schemas" = ["*.json"]
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]

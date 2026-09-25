@@ -24,13 +24,11 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
-import sys
 from pathlib import Path
 
 from pydantic_ai import BinaryContent
 
-from rpent.embodied_agent import EmbodiedAgent, McpServer
+from rpent.embodied_agent import EmbodiedAgent, LocalToolSpec
 from rpent.evaluation.result import write_json_atomic
 from rpent.llm import LLMConfig
 from rpent.tools.toolkit import ToolResult
@@ -123,17 +121,10 @@ def run_task(source: Path, output: Path, key: str, task: str, turns: int) -> dic
         if item["function"]["name"] == "move_eef"
     )
     output.mkdir(parents=True)
-    schema = output / "tools.json"
-    schema.write_text(json.dumps([move]), encoding="utf-8")
     agent = EmbodiedAgent(
-        mcp_servers=[
-            McpServer(
-                name="dojo",
-                expose_unprefixed=True,
-                command=sys.executable,
-                args=(str(Path(__file__).with_name("eef_episode_mcp.py")), str(schema)),
-                env={"PYTHONPATH": os.environ.get("PYTHONPATH", "")},
-            )
+        mcp_servers=[],
+        local_tools=[
+            LocalToolSpec(move["name"], move["description"], move["parameters"])
         ],
         output_dir=output,
         llm=LLMConfig(

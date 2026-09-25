@@ -395,7 +395,10 @@ def test_transient_model_failure_does_not_repeat_robot_tool_call(
     assert len((tmp_path / "llm_errors.jsonl").read_text().splitlines()) == 1
 
 
-def test_rejected_finish_does_not_end_the_run() -> None:
+@pytest.mark.parametrize(
+    "error", ["finish refused by environment", "invalid finish arguments"]
+)
+def test_rejected_finish_does_not_end_the_run(error: str) -> None:
     def model(messages: list[Any], info: Any) -> ModelResponse:
         del info
         if any(
@@ -414,7 +417,7 @@ def test_rejected_finish_does_not_end_the_run() -> None:
             ]
         )
 
-    toolkit = FakeToolkit({"error": "finish refused by environment"})
+    toolkit = FakeToolkit({"error": error})
     result = solve_with_model(model, toolkit, RecordingSink())
 
     assert result.finish_result is None
@@ -422,7 +425,7 @@ def test_rejected_finish_does_not_end_the_run() -> None:
     assert result.stats["tool_calls"] == 1
     assert any(
         message.get("role") == "tool"
-        and message.get("content") == '{\n  "error": "finish refused by environment"\n}'
+        and message.get("content") == json.dumps({"error": error}, indent=2)
         for message in result.messages
     )
 
