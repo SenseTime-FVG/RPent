@@ -1,224 +1,272 @@
-<div align="center">
-  <img src="https://github.com/RLinf/misc/raw/main/pic/rpent_logo.png" alt="RPent-logo" width="520"/>
-</div>
+# 统一 Agent 接口与训练数据
 
-<div align="center">
-<a href="https://arxiv.org/abs/2607.08448"><img src="https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv"></a>
-<a href="https://huggingface.co/RLinf"><img src="https://img.shields.io/badge/HuggingFace-yellow?logo=huggingface&logoColor=white" alt="Hugging Face"></a>
-<a href="https://rpent.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/Documentation-Purple?color=8A2BE2&logo=readthedocs"></a>
-<a href="https://rpent.readthedocs.io/zh-cn/latest/"><img src="https://img.shields.io/badge/中文文档-red?logo=readthedocs"></a>
-<a href="https://github.com/RLinf/misc/blob/main/pic/wechat.jpg?raw=true"><img src="https://img.shields.io/badge/微信-green?logo=wechat&amp"></a>
-</div>
+原项目介绍与安装说明：[中文](README.zh-CN.md) · [English](README_old.md)。
 
-<div align="center">
+## 设计原则
 
-[![English](https://img.shields.io/badge/lang-English-blue.svg)](README.md)
-[![简体中文](https://img.shields.io/badge/语言-简体中文-red.svg)](README.zh-CN.md)
+RPent 负责 VLM/LLM 的逐轮请求、工具调度、context、skill、重试和轨迹采集；
+benchmark 负责重置环境、执行动作、返回观测和原生评分。一个 episode 的典型
+流程是 `任务 -> 模型回复/工具调用 -> 环境执行并返回状态与图像 -> 下一次模型请求`，
+直到环境结束、agent 调用 `finish` 或达到预算。模型自报的 `finish` 状态
+不能代替 benchmark 的成功判定。
 
-</div>
+每次模型请求都以当时实际发送的 system instructions、消息、工具 schema 和
+模型设置为准。Context engine 默认保留历史；用户可在每次请求前改写历史消息。
+它不改变固定的 system instructions 或工具权限。一次逻辑模型请求可能包含
+多次网络 attempt；训练数据应保留 attempt 信息，但只产生一个调用记录。
 
-<h1 align="center">
-  <sub>RPent: Agentic Infrastructure for the Physical World</sub>
-</h1>
+## 用户接口
 
-**RPent (Recursive Physical Agent)** is an open framework for building embodied agents that continuously evolve through recursive interaction with the physical world. Rather than prescribing a single foundation model, RPent provides a recursive agent framework that harnesses heterogeneous intelligence, including perception, reasoning, memory, execution, and self-evolution, into a unified physical agent. Through continuous interaction, reflection, and adaptation, RPent enables physical agents to acquire new capabilities and evolve beyond their initial design. We build RPent upon a foundation of **service-oriented**, **standardized**, and **composable** design principles, ensuring the framework remains highly extensible.
+`EmbodiedAgent` 的四个主要入口是：
 
-<div align="center">
-  <img src="https://github.com/RLinf/misc/raw/main/pic/rpent_framework.png" alt="RPent framework"/>
-</div>
+* `system_prompt`：每个任务的机器人规则、坐标系和动作限制。
+* `skills`：本题全文预加载的 Markdown 文件；`skill_paths`：本题可通过
+  `read_skill` 按需读取的 `SKILL.md` 目录。两者可与 agent 的
+  `RuntimeConfig.skill_paths` 共用。
+* `local_tools` 或 `mcp_servers`：向模型公开动作／观测工具。benchmark
+  与 agent 在同一进程时，用 `LocalToolSpec`；已有 MCP 服务时用
+  `McpServer`。工具结果可用 `ToolResult` 返回文本状态和图片。
+* `RuntimeConfig(context_engine=...)` 或 `context=ContextPolicy(...)`：
+  每次模型请求前组织历史。Python 回调接收 PydanticAI 的 `ModelMessage`
+  列表并返回新列表；SDK 会检查当前输入与工具调用／反馈的配对。
 
-## Leaderboard
+下例在 benchmark 所在线程执行动作，因此不需要运行 MCP 服务：
 
-Compare RPent with reference methods on LIBERO, LIBERO-PRO, RoboCasa365 Target50, and RoboTwin C2R. Rankings apply to the methods and evaluation coverage shown; see the [Leaderboard](https://rpent.readthedocs.io/en/latest/rst_source/leaderboard.html) for suite results and model configurations.
+```python
+from pathlib import Path
 
-Codex / GPT-6 Astra / low / reasoning: **92.63% Overall (741/800)** across all eight LIBERO-PRO suites. See the [suite results and memory-batch explanation](https://rpent.readthedocs.io/en/latest/rst_source/leaderboard.html#libero-pro-astra-memory), including the separately frozen Long and Spatial/Object/Goal memory batches.
+from rpent.embodied_agent import EmbodiedAgent, LocalToolSpec
+from rpent.llm import LLMConfig
+from rpent.runtime import RuntimeConfig
+from rpent.tools.toolkit import ToolResult
 
-[![RPent Leaderboard](https://cdn.jsdelivr.net/gh/RLinf/misc@a6657fc43a6b3874a20ee1695a480090a4737c35/rpent/benchmarks/leaderboard-en-light.png)](https://rpent.readthedocs.io/en/latest/rst_source/leaderboard.html)
+agent = EmbodiedAgent(
+    mcp_servers=[],
+    local_tools=[LocalToolSpec(
+        name="move_eef",
+        description="移动末端并返回执行后的机器人状态和相机图像。",
+        input_schema={
+            "type": "object",
+            "properties": {"pose": {"type": "array", "items": {"type": "number"}}},
+            "required": ["pose"],
+        },
+    )],
+    output_dir=Path("runs/task-001"),
+    llm=LLMConfig(provider="openai", model="YOUR_MODEL"),
+    runtime=RuntimeConfig(),  # 默认 full trace 和 append 历史
+)
+with agent.start_episode(
+    "把红色方块放进碗里。",
+    system_prompt="使用世界坐标系的 move_eef；每次动作后检查新观测。",
+    skill_paths=["skills/grasp"],
+    deferred_tools=["move_eef"],
+) as episode:
+    while (call := episode.next_call(timeout=300)) is not None:
+        observation = benchmark.execute_and_observe(call.arguments)
+        episode.complete(call, ToolResult(call.name, {
+            "state": observation.state,
+            "_image_bytes": observation.camera_png,
+            "_finish": observation.episode_done,
+        }))
+        if observation.episode_done:
+            break
+    result = episode.wait(timeout=300)
+native_score = benchmark.read_native_score()
+```
 
+有同步、线程安全的工具处理函数时，可在 `LocalToolSpec(handler=...)` 提供
+`dict -> ToolResult`，再调用 `agent.run(...)`。已有远程工具则传入
+`McpServer(name="robot", url="http://127.0.0.1:8000/mcp")`；也支持 stdio。
+一个 agent 可同时声明本地与 MCP 工具，名称必须互不冲突。每个 episode 使用
+独立环境和输出目录；GPU 仿真通常要由 benchmark 使用进程或集群 worker 隔离。
+`start_episode` 的 `deferred_tools` 必须覆盖所有没有 handler 的本地工具。
 
-## Who Should Consider Using RPent?
+自定义 context engine 的最小形式是：
 
-RPent is built for four kinds of users:
+```python
+def my_context(ctx, messages):
+    return messages  # 默认 append；可按完整工具调用/反馈组裁剪或摘要
 
-- **Embodied intelligence researchers** targeting high success rates on embodied tasks and benchmarks — especially long-horizon manipulation. RPent's memory-guided, agentic composition consistently lifts task success beyond what a frozen VLA delivers alone.
-- **Online-learning and reinforcement-learning researchers** studying self-evolving embodied agents. RPent's recursive interaction, reflection, and memory-distillation loops provide a ready substrate for continual and reinforcement learning in the physical world.
-- **Robotics application developers** deploying embodied solutions on real robot hardware. RPent's service-oriented, standardized architecture and customizable agentic control logic improve real-world success rates and shorten the path from prototype to production.
-- **End users of deployed embodied agents** — the customers of the developers above. Install RPent together with the relevant real-robot extensions and run the predefined tasks out of the box, with no ML expertise required.
+runtime = RuntimeConfig(context_engine=my_context)
+```
 
-## What's NEW!
+完整的 callback 约束、异步摘要、模型与 trace 选项见 [Agent runtime](docs/source-zh/rst_source/usage/agent_runtime.rst)。
 
-- [2026/09] 🔥 Added the interactive RPent Leaderboard for LIBERO, LIBERO-PRO, RoboCasa365, and RoboTwin, with model comparisons and suite-level results. Explore the [Leaderboard](https://rpent.readthedocs.io/en/latest/rst_source/leaderboard.html).
-- [2026/09] 🔥 RPent supports Franka single-arm and dual-arm real-robot extensions. Doc: [Franka](https://rpent.readthedocs.io/en/latest/rst_source/usage/franka.html) · [Dual Franka](https://rpent.readthedocs.io/en/latest/rst_source/usage/dual_franka.html).
-- [2026/08] 🔥 RPent supports RoboCasa with RLDX-1 as manipulation model. See the [RoboCasa setup and Target50 guide](https://rpent.readthedocs.io/en/latest/rst_source/usage/robocasa.html).
-- [2026/08] 🔥 RPent supports the non-reasoning mode, which reduces average execution time by ~40%.
-- [2026/08] 🔥 RPent supports exploration mode for LIBERO. Doc: [LIBERO exploration mode](https://rpent.readthedocs.io/en/latest/rst_source/usage/libero.html#exploration-and-local-memory-evaluation).
-- [2026/08] 🔥 RPent supports RoboTwin with LingBot-VLA for dual-arm manipulation tasks. Doc: [RoboTwin](https://rpent.readthedocs.io/en/latest/rst_source/usage/robotwin.html).
-- [2026/07] 🔥 Our first RPent publication, [Harness VLA: Steering Frozen VLAs into Reliable Manipulation Primitives via Memory-Guided Agents](https://arxiv.org/abs/2607.08448), is released.
+## 标准训练数据
 
-## Feature Matrix
+训练 episode 使用 `rpent/schemas/training_episode.v1.json` 定义的 JSON
+Schema。每个新目录包含 `episode.json` 与按 SHA-256 去重的 `assets/`：
 
-<table width="100%" style="width: 100%; table-layout: auto; border-collapse: collapse;">
-  <thead align="center" valign="bottom">
-    <tr>
-      <th style="min-width: 300px;">Agentic Planner</th>
-      <th style="min-width: 340px;">Action Primitive</th>
-      <th style="min-width: 300px; text-align: left;">Simulator</th>
-      <th style="min-width: 260px;">Real World</th>
-    </tr>
-  </thead>
-  <tbody valign="top">
-    <tr>
-      <td>
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/configure_planner.html#the-claude-code-planner">Claude Code</a> ✅</li>
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/configure_planner.html#the-codex-planner">Codex</a> ✅</li>
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/configure_planner.html#add-a-custom-planner">Custom Planner</a> ✅</li>
-        </ul>
-      </td>
-      <td>
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li><b>VLA</b></li>
-          <ul>
-            <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/libero.html">Pi0.5</a> ✅</li>
-            <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/robocasa.html">RLDX-1</a> ✅</li>
-            <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/robotwin.html">LingBot-VLA</a> ✅</li>
-          </ul>
-          <li><b>WAM</b></li>
-          <ul>
-            <li>DreamZero</li>
-          </ul>
-        </ul>
-      </td>
-      <td style="text-align: left; padding-left: 8px;">
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/libero.html">LIBERO-PRO</a> ✅</li>
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/robocasa.html">RoboCasa</a> ✅</li>
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/robotwin.html">RoboTwin</a> ✅</li>
-          <li>RoboDojo</li>
-        </ul>
-      </td>
-      <td>
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/franka.html">Franka</a> ✅</li>
-          <li><a href="https://rpent.readthedocs.io/en/latest/rst_source/usage/dual_franka.html">Dual Franka</a> ✅</li>
-          <li>SO-101</li>
-          <li>YAM</li>
-        </ul>
-      </td>
-    </tr>
-  </tbody>
-</table>
+* `task`：benchmark 名称与版本、task ID、instruction、seed 和扩展元数据。
+* `calls`：按时间排列的逻辑 LLM 调用。每条包含实际请求的 system prompt、
+  消息、图片引用、工具 schema、模型设置，以及 assistant 回复、工具调用、
+  本轮工具反馈、请求状态、usage 和所有 attempt。消息中的 `cache_point`
+  保留缓存边界；`purpose` 区分主 agent、
+  子 agent 与 context 压缩请求。
+* `outcome`：benchmark 原生 success、score 与状态。失败 episode 也可保存，
+  由训练任务自行决定筛选规则。
+* `provenance`：来源类型与 run ID、采集和导出时间、原始 trace manifest
+  的 SHA-256，以及采集时各组件的版本。未知版本留空，不用当前导出环境猜测。
 
-## Quick Start
+图片可以用字节、base64、文件路径或相对于 `source_dir` 的 `asset_ref`
+传入；转换器会复制并校验内容。仅有远程 URL 的图片需要 benchmark 先提供
+实际图像文件。文件采用新目录原子发布；同名目录不会覆盖。
 
-To evaluate RPent with a benchmark that exposes robot actions and camera
-observations as MCP tools, use the Python
-[`EmbodiedAgent` entry point](docs/source-en/rst_source/usage/embodied_agent.rst).
-It accepts benchmark instructions through a system prompt and skill files.
-For in-process tools, task-selected skills, context engines, and cross-benchmark
-training conversion, see [Unified Agent and Training Data](docs/source-en/rst_source/usage/unified_agent.rst).
+当 benchmark 自己持有逐次 LLM 输入输出时，直接使用转换接口：
 
-**1. Choose an environment and install RPent.**
+```python
+from rpent.training_data import convert_episode, load_training_episode
+
+path = convert_episode(
+    {"benchmark": "my_benchmark", "task_id": "pick-01",
+     "instruction": "Pick the block", "seed": 0},
+    [{
+        "call_id": "llm-1",
+        "request": {
+            "system_prompt": "Use move_eef.",
+            "messages": [{"role": "user", "content": [
+                "Pick the block",
+                {"type": "image", "media_type": "image/png", "data": camera_png},
+            ]}],
+            "tools": [{"name": "move_eef", "description": "Move arm",
+                       "input_schema": {"type": "object", "properties": {}}}],
+        },
+        "response": {"message": {"role": "assistant", "tool_calls": [
+            {"id": "action-1", "name": "move_eef", "arguments": {}},
+        ]}},
+        "tool_results": [{"role": "tool", "name": "move_eef",
+                         "tool_call_id": "action-1", "content": "arrived"}],
+    }],
+    outcome={"success": True, "score": 1.0},
+    output_dir="training/pick-01-seed-0",
+    provenance={"source_run_id": "benchmark-run-01",
+                "versions": {"agent_commit": "<采集时的 commit>",
+                             "simulator": "<仿真环境版本>",
+                             "scorer": "<评分器版本>"}},
+)
+record = load_training_episode(path)  # 校验 schema 与全部图片哈希
+```
+
+`response` 可以是字符串，表示纯文本 assistant 回复。失败模型请求设置
+`status="error"`、`response=None`；重试 attempt 留在同一 call 的
+`attempts`。没有后续模型请求的最后一次环境反馈，应放在本次 call 的
+`tool_results` 中，避免丢失终止观测。
+
+RPent 自己运行的 episode 可在 benchmark 原生评分后直接转换 full trace：
+
+```python
+from rpent.training_trace import convert_rpent_trace
+
+path = convert_rpent_trace(
+    "runs/task-001",
+    {"benchmark": "my_benchmark", "task_id": "pick-01",
+     "instruction": "Pick the block", "seed": 0},
+    outcome={"success": native_score.success, "score": native_score.score},
+    output_dir="training/pick-01-seed-0",
+    versions={"agent_commit": "<采集时的 commit>"},
+)
+```
+
+必须在 agent 中传入 `runtime=RuntimeConfig()` 或等价的 full trace 配置。
+`metadata`／`off` 无法恢复模型输入输出。转换保留每个逻辑请求的 attempt，
+并复制 trace 中实际发给模型的图像。该快照位于 provider adapter 边界，
+不是 HTTP 原始字节；网络失败且没有返回正文时不存在可训练的 assistant 输出。
+
+## 数据集目录与版本
+
+单独调用 `convert_episode` 会生成可验证的 episode，但不会建立数据集索引。
+正式收集使用 `TrainingDataset`，目录固定为：
+
+```text
+<output-root>/<dataset-id>/<dataset-version>/
+  manifest.json
+  episodes/<split>/<benchmark>/<task-id>/<episode-id>/
+    episode.json
+    assets/<sha256>.<ext>
+```
+
+`split` 只能是 `train`、`validation` 或 `test`。路径中的任务标识会
+转义，原始值以 `episode.json` 和 `manifest.json` 为准。同一数据集版本中，
+相同 benchmark 与 task ID 的 episode 必须进入同一个 split，避免按 run
+随机切分导致同题泄漏。不同版本的数据集互不覆盖。
+
+`manifest.json` 的格式见 `rpent/schemas/training_dataset.v1.json`。
+它保存数据集 ID 与版本、manifest/episode schema 版本、创建和更新时间、
+导出程序的名称／版本／代码 commit、数据集元信息、状态及每条 episode 的
+相对路径、split、任务和评分摘要、`episode.json` 的 SHA-256。图片哈希保存在
+各 episode 内。`verify()` 同时核对索引、episode 内容和全部图片。
+
+版本字段各有用途：`schema_version` 只在格式发生不兼容变化时升级；
+`dataset_version` 标识一次确定的数据集发布；`benchmark_version`
+标识题目定义；`provenance.versions` 记录采集时的 agent 代码 commit、
+仿真器、评分器、prompt 和 skill 版本；每次请求还记录实际模型名。
+`producer.git_commit` 是**导出程序**的 commit，不能替代采集时的 agent
+commit。采集时版本若没有记录，后续转换无法可靠推断。
+
+```python
+from rpent.training_dataset import TrainingDataset
+
+dataset = TrainingDataset.create(
+    "/data/training",
+    dataset_id="robot-actions",
+    dataset_version="2026-09.v1",
+    producer={"name": "my-exporter", "version": "1.0",
+              "git_commit": "<导出程序 commit>"},
+    metadata={"license": "internal", "description": "arm manipulation"},
+)
+path = dataset.add_rpent_trace(
+    "runs/task-001",  # 也可用 add_episode(task, calls, episode_id=...)
+    {"benchmark": "my_benchmark", "benchmark_version": "2026-09",
+     "task_id": "pick-01", "instruction": "Pick the block", "seed": 0},
+    split="train",
+    outcome={"success": native_score.success, "score": native_score.score},
+    versions={"agent_commit": "<采集时的 commit>",
+              "simulator": "<仿真环境版本>",
+              "scorer": "<评分器版本>",
+              "prompt": "<prompt 版本>", "skills": "<skill 版本>"},
+)
+dataset.verify()
+dataset.seal()
+```
+
+创建新版本时目录必须不存在。同一支持 `flock` 的文件系统上，多个 worker
+可向同一 draft 版本追加 episode；写入采用文件锁并原子更新 manifest。
+`seal()` 校验后封版，接口拒绝后续追加；
+修改样本或切分应创建新的 `dataset_version`。导出中途失败时保留 draft
+及已索引的样本，检查后可用 `TrainingDataset.open(path)` 继续追加。
+
+## RoboDojo 接入示例
+
+`examples/robodojo/eef_episode_policy.py` 将 RoboDojo 的 `move_eef`
+定义为 `LocalToolSpec`，让 Isaac 所在线程执行运动并在反馈中提供状态与三路
+RGB；RPent 持续运行一个 agent 对话并采集 full trace。安装、缓存预检与
+GPU worker 启动步骤见仓库的 `examples/robodojo/README.md`。原生分数产生后：
 
 ```bash
-git clone https://github.com/RLinf/RPent rpent && cd rpent
-pip install -e ".[libero-pro]"  # Recommended default (LIBERO-PRO)
-
-# Other environment configurations:
-pip install -e ".[robocasa]"    # RoboCasa
-pip install -e ".[robotwin]"    # RoboTwin
+python examples/robodojo/export_training.py \
+  --experiment /path/to/scored-experiment \
+  --output-root /path/to/training-data \
+  --dataset-id robodojo-eef --dataset-version 2026-09.v1 \
+  --split train --seed 0 --benchmark-version 2026-09 \
+  --versions-file /path/to/versions.json \
+  --exporter-commit abc123 --seal
 ```
 
-`.[libero-pro]` is the recommended default. See the [installation docs](https://rpent.readthedocs.io/en/latest/rst_source/installation.html) for other environments.
+该脚本将 `results/once-status.json` 的原生 success/score 与对应 RPent trace
+关联，并创建上述数据集目录和索引。`versions.json` 是采集时版本的 JSON
+对象，例如 `{"agent_commit":"...","simulator":"...","scorer":"...","prompt":"...","skills":"..."}`；
+未知值可省略。将示例中的 `abc123`
+替换为导出程序的实际 commit；`--exporter-commit` 单独记录它。
+`--successful-only` 可只导出成功 episode。旧 RoboDojo 运行若没有
+full trace 或记录任务 instruction，不能凭请求用量日志恢复训练样本。
 
-For RoboCasa setup, task memory, and the Target50 protocol, see the
-[RoboCasa guide](https://rpent.readthedocs.io/en/latest/rst_source/usage/robocasa.html).
+## 错误、重试与 API 记录
 
-The example below continues with LIBERO-PRO.
-
-**2. Download the LIBERO-PRO simulator assets.**
-
-```bash
-liberopro-download-assets --skip-existing
-```
-
-> 💡 Slow connection to Hugging Face? Download through the mirror: `HF_ENDPOINT=https://hf-mirror.com liberopro-download-assets --skip-existing`.
-
-See the [installation docs](https://rpent.readthedocs.io/en/latest/rst_source/installation.html) for other simulators.
-
-**3. Configure keys and checkpoints, then run.**
-
-```bash
-# Anthropic key; no need to export the base url if you use the official endpoint.
-export ANTHROPIC_BASE_URL=https://xxx
-export ANTHROPIC_API_KEY=sk-xxx
-
-# VLA checkpoint — download from
-# https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT
-hf download RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT \
-  --exclude optimizer.pt \
-  --local-dir ./checkpoints/RLinf-Pi05-LIBERO-130-fullshot-SFT
-
-export PI05_CHECKPOINT_PATH=$PWD/checkpoints/RLinf-Pi05-LIBERO-130-fullshot-SFT
-
-# SAM 3.0 checkpoint — download from
-# https://modelscope.cn/models/facebook/sam3
-pip install -U modelscope
-
-modelscope download facebook/sam3 \
-  --local-dir ./checkpoints/sam3
-
-export SAM3_CHECKPOINT_PATH=$PWD/checkpoints/sam3/sam3.pt
-export LIBERO_TYPE=pro
-
-# Run one task: libero_object_swap, task 2, seed 0, using Claude Code
-# with Claude Opus 4.8.
-rpent --robot libero --suite libero_object_swap --task 2 --seed 0 \
-  --cuda-device 0 --planner claude_code --model claude-opus-4-8
-```
-
-See the [planner docs](https://rpent.readthedocs.io/en/latest/rst_source/usage/configure_planner.html) to configure other planners (`api`, `codex`) and model providers.
-For the exploration workflow and local-memory evaluation, see [LIBERO exploration mode](https://rpent.readthedocs.io/en/latest/rst_source/usage/libero.html#exploration-and-local-memory-evaluation).
-
-### Interactive CLI mode
-
-Add `--interactive` (`-i`) to steer the agent live from your terminal. At the `you>` prompt, the built-in task is pre-filled — press Enter to use it or replace it with your own — then type any message while it runs to steer the agent at the next turn (`/help` lists commands; `/quit` or Ctrl-D ends). Requires an interactive terminal (TTY).
-
-```bash
-rpent --robot libero --suite libero_object_swap --task 2 --seed 0 \
-  --planner claude_code --model claude-opus-4-8 --interactive
-```
-
-### Live Dashboard
-
-Add `--dashboard` to start a local Dashboard and print its URL in the terminal. Session settings come from the CLI, and the page opens directly in the live monitor. Once the services are ready, start a task with `/rpent-task <suite> <task> <seed>`. The page streams agent reasoning, camera views, and the action timeline, and you can submit another task after the current one finishes. Use `--dashboard-language zh-cn` for the Chinese UI.
-
-```bash
-rpent --robot libero --dashboard --dashboard-language zh-cn \
-  --planner claude_code --model claude-opus-4-8
-```
-
-For a complete list of CLI options, see the [Key CLI options](https://rpent.readthedocs.io/en/latest/rst_source/quickstart.html#key-cli-options) table in the Quick Start docs. RoboCasa and RoboTwin use their own entrypoints and CLI — see the [RoboCasa](https://rpent.readthedocs.io/en/latest/rst_source/usage/robocasa.html) and [RoboTwin](https://rpent.readthedocs.io/en/latest/rst_source/usage/robotwin.html) docs.
-
-For more detailed documentation, see the [RPent documentation](https://rpent.readthedocs.io/en/latest/).
-
-## Contributing
-
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-development setup, required checks, testing policy, and integration checklists.
-
-## Citation and Acknowledgement
-
-If you find **RPent** or **Harness VLA** helpful, please cite the paper:
-
-```bibtex
-@article{zhang2026harnessvla,
-  title={Harness VLA: Steering Frozen VLAs into Reliable Manipulation Primitives via Memory-Guided Agents},
-  author={Zhang, Yixian and Zhang, Huanming and Gao, Feng and Li, Xiao and Liu, Zhihao and Zhu, Chunyang and Qiu, Jiaxing and Yan, Yuchen and Liu, Jiyuan and Tang, Wenhao and Fang, Zhengru and Nie, Yi and Wei, Changxu and Wang, Yu and Ding, Wenbo and Yu, Chao},
-  journal={arXiv preprint arXiv:2607.08448},
-  year={2026},
-  url={https://arxiv.org/abs/2607.08448}
-}
-```
-
-RPent builds on the simulators, VLA models, and training infrastructure of [RLinf](https://github.com/RLinf/RLinf), and on the agent SDKs of the broader open-source community — [pydantic-ai](https://ai.pydantic.dev/), the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview), and the OpenAI Codex SDK. Thanks to the teams behind LIBERO, RoboCasa, robosuite, MuJoCo, and openpi.
+`RetryPolicy(max_retries=3)` 表示首次请求后最多三次网络重试。
+HTTP 408、409、425、429、5xx、提供商 API 错误和连接／超时错误可重试；
+HTTP 400、401、403 等永久性错误不重试。已开始消费的流不重放，已经完成
+的机器人动作也不会因模型请求重试而重复执行。
+`llm_requests.jsonl` 逐 attempt 记录状态、请求体量和提供商报告的 usage；
+`llm_errors.jsonl` 额外保存脱敏后的错误返回正文、状态码和请求标识。
+Full trace 保存模型适配器的请求与成功响应快照。它不承诺保存原始 HTTP
+headers、逐字节响应或提供商未返回的 token 用量。

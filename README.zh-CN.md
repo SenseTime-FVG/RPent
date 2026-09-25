@@ -12,7 +12,7 @@
 
 <div align="center">
 
-[![English](https://img.shields.io/badge/lang-English-blue.svg)](README.md)
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](README_old.md)
 [![简体中文](https://img.shields.io/badge/语言-简体中文-red.svg)](README.zh-CN.md)
 
 </div>
@@ -113,7 +113,7 @@ RPent 面向以下四类用户：
 [`EmbodiedAgent` 入口](docs/source-zh/rst_source/usage/embodied_agent.rst)
 接入 RPent，并通过 system prompt 和 skill 文件提供评测任务的约束。
 本进程工具、逐题 skill、context engine 和跨 benchmark 训练数据转换见
-[统一 Agent 与训练数据](docs/source-zh/rst_source/usage/unified_agent.rst)。
+[统一 Agent 与训练数据](README.md)。
 
 **1. 选择一个环境并安装 RPent。**
 
