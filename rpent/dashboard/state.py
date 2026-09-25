@@ -32,6 +32,7 @@ from rpent.dashboard.events import (
     RunStartedEvent,
     RuntimeStatusEvent,
     StepRecordEvent,
+    TraceUpdatedEvent,
     TranscriptEvent,
     UsageEvent,
 )
@@ -222,6 +223,11 @@ class DashboardState:
         self._projection_version = 0
         self._session_state = "starting_shared_services"
         self._task_generation = 0
+        self._task_output_dir = root.resolve()
+        self._trace_output_dir: Path | None = None
+        self._trace_run_id: str | None = None
+        self._trace_last_seq = 0
+        self._retired_trace_ids: set[str] = set()
         self._pending_task: TaskRequest | None = None
         self._current_task: TaskRequest | None = None
         self._control_feedback: list[str] = []
@@ -479,6 +485,11 @@ class DashboardState:
     ) -> None:
         self._current_task = request
         self.video_path = output_dir / "episode.mp4"
+        self._task_output_dir = output_dir.resolve()
+        self._trace_output_dir = None
+        self._trace_run_id = None
+        self._trace_last_seq = 0
+        self._retired_trace_ids.clear()
         self._session_state = "task_starting"
         self._task_state = "starting"
         self._terminated = False
@@ -727,6 +738,26 @@ class DashboardState:
 
     def emit(self, event: DashboardEvent) -> None:
         """Project one structured event into the existing frontend state."""
+        if isinstance(event, TraceUpdatedEvent):
+            output_dir = event.output_dir.resolve()
+            with self._condition:
+                # Exploration records each session below the task's directory.
+                # Late callbacks from a retired task/session cannot select it.
+                if (
+                    not output_dir.is_relative_to(self._task_output_dir)
+                    or event.run_id in self._retired_trace_ids
+                ):
+                    return
+                if self._trace_run_id != event.run_id:
+                    if self._trace_run_id is not None:
+                        self._retired_trace_ids.add(self._trace_run_id)
+                    self._trace_output_dir = output_dir
+                    self._trace_run_id = event.run_id
+                    self._trace_last_seq = 0
+                if event.last_seq > self._trace_last_seq:
+                    self._trace_last_seq = event.last_seq
+                    self._projection_changed_locked()
+            return
         if isinstance(event, TranscriptEvent):
             with self._condition:
                 self._events.append(event.payload)
@@ -966,6 +997,11 @@ class DashboardState:
             "truncated": self._truncated,
             "error": self._error,
             "usage": dict(self._usage),
+            "trace": (
+                {"run_id": self._trace_run_id, "last_seq": self._trace_last_seq}
+                if self._trace_run_id is not None
+                else None
+            ),
             "runtime": self._runtime_snapshot(),
             "has_video": (
                 self._task_state in TERMINAL_RUN_STATES and self.video_path.exists()
@@ -982,6 +1018,11 @@ class DashboardState:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return self._snapshot_locked()
+
+    def trajectory_source(self) -> tuple[Path | None, str | None, int]:
+        """Return the selected trace and task generation as one consistent identity."""
+        with self._lock:
+            return self._trace_output_dir, self._trace_run_id, self._task_generation
 
     def wait_for_snapshot(
         self,

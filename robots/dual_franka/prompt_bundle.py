@@ -26,6 +26,37 @@ from rpent.prompt.utils import Numbered, PromptNode
 
 def system_prompt(variables: Mapping[str, object] | None = None) -> PromptNode:
     """Assemble the dual-Franka system prompt."""
+    if not (variables or {}).get("enable_vla", True):
+        explore = (variables or {}).get("mode") == "explore"
+        node = {
+            "ROLE": system_parts.ROLE,
+            "RUNTIME": system_parts.RUNTIME,
+            "SAFETY RULES": Numbered(system_parts.RULES),
+            "CAMERA AND PROJECTION RULES": Numbered(system_parts.CAMERA_AND_PROJECTION),
+            "CONTROL": (
+                "VLA is disabled. Use only exposed bounded tools. Task constraints "
+                "that require a learned segment describe an unavailable phase: "
+                "stop and report that limitation before the phase. Do not replace "
+                "learned contact or bimanual transfer with improvised scripted "
+                "motions. Read describe_dual_franka_setup and inspect current "
+                "state before any supported action."
+            ),
+        }
+        if explore:
+            node.update(
+                {
+                    "EXPLORATION MODE": explore_parts.MODE,
+                    "EXPLORATION WORKFLOW": Numbered(
+                        (
+                            *explore_parts.RULES[:2],
+                            "Use the available tools reported by describe_dual_franka_setup.",
+                            *explore_parts.RULES[3:],
+                        )
+                    ),
+                    "LAYERED MEMORY": explore_parts.MEMORY,
+                }
+            )
+        return node
     if (variables or {}).get("mode") == "explore":
         return explore_parts.system_prompt()
     node: dict[str, object] = {

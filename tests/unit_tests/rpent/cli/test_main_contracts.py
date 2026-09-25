@@ -146,6 +146,33 @@ def test_shared_cli_defaults_reach_robot_config_parser(
     assert args.memory_profile == "hf"
 
 
+def test_runtime_config_reaches_cli_robot_setup(tmp_path, monkeypatch):
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        "subagents:\n  reader:\n    instructions: Analyze the scene.\n",
+        encoding="utf-8",
+    )
+    _, args = _capture_validated_args(
+        monkeypatch, ["--robot", "libero", "--runtime-config", str(path)]
+    )
+    assert args.agent_runtime.subagents["reader"].instructions == "Analyze the scene."
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude_code", "flash"])
+def test_runtime_config_rejected_for_other_cli_planners(
+    tmp_path, monkeypatch, capsys, backend
+):
+    path = tmp_path / "runtime.yaml"
+    path.write_text("subagents: {}", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        _capture_validated_args(
+            monkeypatch,
+            ["--robot", "libero", "--planner", backend, "--runtime-config", str(path)],
+        )
+    assert exc.value.code == 2
+    assert "--runtime-config requires --planner=api" in capsys.readouterr().err
+
+
 def test_deprecated_env_alias_routes_to_the_same_robot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -388,9 +415,13 @@ def test_handoff_message_lists_prior_attempts_deterministically(tmp_path: Path) 
     assert "memory inbox under wip/" in message
 
 
+@pytest.mark.parametrize("sessions", [1, 2])
+@pytest.mark.parametrize("interactive", [False, True])
 def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    sessions: int,
+    interactive: bool,
 ) -> None:
     cli = _cli_module()
     from rpent.planner.base import PlannerResult
@@ -431,7 +462,7 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
             self.closed = True
 
         def solved(self) -> bool:
-            return True
+            return len(calls["solve_calls"]) == sessions
 
         def write_recipe(self, recipe_tag: str) -> str:
             calls["write_recipe"] = recipe_tag
@@ -455,6 +486,7 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
                 "input_queue": input_queue,
                 "dashboard_interaction": dashboard_interaction,
             }
+            calls.setdefault("solve_calls", []).append(calls["solve"])
             finish = toolkit.execute_tool(
                 "finish",
                 {"status": "success", "summary": "simulated task complete"},
@@ -506,6 +538,7 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
 
     def build_planner(*args: Any, **kwargs: Any) -> ScriptedPlanner:
         calls["build_planner"] = (args, kwargs)
+        calls.setdefault("planner_runtimes", []).append(kwargs.get("runtime"))
         return planner
 
     def get_toolkit(*args: Any, **kwargs: Any) -> FakeToolkit:
@@ -521,6 +554,15 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
     monkeypatch.setattr(cli, "build_planner", build_planner)
     monkeypatch.setattr(cli, "get_toolkit", get_toolkit)
     monkeypatch.setattr("rpent.memory.MemoryManager.sync", reject_memory_sync)
+    monkeypatch.setattr(cli, "start_interactive_reader", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        cli, "start_first_prompt_resolver", lambda queue: lambda: "operator-edited task"
+    )
+    runtime_path = tmp_path / "runtime.yaml"
+    runtime_path.write_text(
+        "subagents:\n  reviewer:\n    instructions: Review the plan.\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -538,21 +580,42 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
             str(tmp_path),
             "--max-turns",
             "4",
+            "--explore-sessions",
+            str(sessions),
+            "--runtime-config",
+            str(runtime_path),
+            *(["--interactive"] if interactive else []),
         ],
     )
 
     assert cli.main() == 0
 
-    assert calls["solve"] == {
+    first_call = calls["solve_calls"][0]
+    assert first_call == {
         "system_prompt": "simulated system prompt\n",
-        "user_message": "simulated user task\n",
+        "user_message": "operator-edited task"
+        if interactive
+        else "simulated user task\n",
         "max_turns": 4,
-        "input_queue": None,
+        "input_queue": first_call["input_queue"] if interactive else None,
         "dashboard_interaction": None,
     }
-    assert toolkit.calls == [
-        ("finish", {"status": "success", "summary": "simulated task complete"})
-    ]
+    if interactive:
+        assert first_call["input_queue"] is not None
+    assert len(calls["solve_calls"]) == sessions
+    assert len(calls["planner_runtimes"]) == sessions
+    assert all(
+        config.subagents["reviewer"].instructions == "Review the plan."
+        for config in calls["planner_runtimes"]
+    )
+    if sessions == 2:
+        assert calls["solve"]["system_prompt"] == "simulated system prompt\n"
+        assert calls["solve"]["user_message"].startswith("You are agent 2 of up to 2")
+    assert (
+        toolkit.calls
+        == [("finish", {"status": "success", "summary": "simulated task complete"})]
+        * sessions
+    )
     assert toolkit.closed is True
     assert daemon.stopped is True
     assert calls["get_toolkit"][1]["runtime_kwargs"] == {"runtime": "simulated"}
@@ -573,14 +636,17 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
         "summary": "simulated task complete",
     }
     assert transcript["stats"]["tool_calls"] == 1
-    assert transcript["messages"] == [
-        {"role": "assistant", "content": "finished offline"}
-    ]
+    assert (
+        transcript["messages"]
+        == [{"role": "assistant", "content": "finished offline"}] * sessions
+    )
 
 
+@pytest.mark.parametrize("runtime_model", [False, True])
 def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    runtime_model: bool,
 ) -> None:
     cli = _cli_module()
     from rpent.evaluation import RunFinalizationContext, write_json_atomic
@@ -658,6 +724,11 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     monkeypatch.setattr(cli, "get_robot_spec", lambda name: robot_spec)
     monkeypatch.setattr(cli, "build_planner", lambda *args, **kwargs: FakePlanner())
     monkeypatch.setattr(cli, "get_toolkit", lambda *args, **kwargs: robot_toolkit)
+    runtime_path = tmp_path / "runtime.yaml"
+    runtime_path.write_text(
+        'llm: {provider: openai, model: configured-model}\ntrace: {mode: "off"}\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -670,9 +741,12 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
             "--seed",
             "1",
             "--planner",
-            "codex",
-            "--model",
-            "gpt-5.5",
+            "api" if runtime_model else "codex",
+            *(
+                ["--runtime-config", str(runtime_path)]
+                if runtime_model
+                else ["--model", "gpt-5.5"]
+            ),
             "--reasoning-effort",
             "xhigh",
             "--planner-timeout-s",
@@ -693,8 +767,11 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     assert context.robot_name == "testrobot"
     assert context.environment_success is False
     assert context.agent_error is None
-    assert context.planner == "codex"
-    assert context.model == "gpt-5.5"
+    assert context.planner == ("api" if runtime_model else "codex")
+    expected_model = "openai:configured-model" if runtime_model else "gpt-5.5"
+    assert context.model == expected_model
+    transcript = json.loads((tmp_path / "transcript_OpenDrawer_s1.json").read_text())
+    assert transcript["model"] == expected_model
     assert context.reasoning_effort == "xhigh"
     assert context.max_turns == 100
     assert context.planner_timeout_s == 1800

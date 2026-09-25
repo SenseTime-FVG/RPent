@@ -100,6 +100,7 @@ def get_toolkit(
     runtime_kwargs: dict[str, Any],
     dashboard_events: DashboardEventSink,
     config: RunConfig,
+    enable_vla: bool = True,
     mode: str = "evaluation",
     attempts_per_session: int = 0,
     state_output_dir: Path | str | None = None,
@@ -115,6 +116,7 @@ def get_toolkit(
         inbox_cell_tag=config.recipe_tag if explore else None,
     )
     return DualFrankaToolkit(
+        enable_vla=enable_vla,
         runtime_kwargs=runtime_kwargs,
         dashboard_events=dashboard_events,
         memory=memory,
@@ -201,6 +203,8 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         recipe_tag=f"dual_franka_t{args.task_id}",
         output_dir=output_dir,
         prompt_vars={
+            "enable_vla": getattr(args, "enable_vla", True)
+            and (args.vla_endpoint is not None or task.vla_instruction is not None),
             "task_id": args.task_id,
             "task_name": task.name,
             "instruction": task.instruction,
@@ -380,7 +384,10 @@ def _init_runtime(
     from rpent.robots.components.sam3_client import Sam3Client
 
     available = {"env", "vla", "sam3"}
-    selected = available if components is None else components
+    selected = set(available if components is None else components)
+    enable_vla = getattr(args, "enable_vla", True)
+    if not enable_vla:
+        selected.discard("vla")
     unknown = selected.difference(available)
     if unknown:
         raise ValueError(f"unknown dual-Franka runtime components: {sorted(unknown)}")
@@ -428,6 +435,8 @@ def _init_runtime(
         )
 
     runtime_kwargs: dict[str, Any] = {}
+    if not enable_vla:
+        runtime_kwargs["model"] = None
     wait_order = ("env", "sam3", "vla")
     for component in (name for name in wait_order if name in pending):
         daemon, rpc = pending[component]

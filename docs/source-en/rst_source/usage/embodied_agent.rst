@@ -163,6 +163,79 @@ agent's own conclusion in ``PlannerResult.finish_result``. That conclusion is
 not a benchmark success signal; always use the environment's score or success
 predicate for evaluation.
 
+Selected memory and initial observations
+----------------------------------------------------
+
+Pass already selected memory excerpts with ``memory``. Each ``TextDocument``
+retains a title, text, and optional source identifier:
+
+.. code-block:: python
+
+   from rpent.data_convert import TextDocument
+
+   result = agent.run(
+       "Place the red block in the bowl.",
+       system_prompt="Use the registered robot tools and inspect each result.",
+       skills=["benchmark/SKILL.md"],
+       memory=[TextDocument(
+           title="Top grasp",
+           text="Approach this object from above; recheck its current pose.",
+           source="memory/grasp.md",
+       )],
+   )
+
+Memory is appended to the task as labeled reference text, including its source
+when provided. It is not added to ``system_prompt``. The caller owns selection
+and authorization of these excerpts; ``source`` is provenance and is never
+opened by the assembler. Existing robot memory access and merge policies are
+unchanged.
+
+``initial_context`` accepts a sequence of text and PydanticAI ``BinaryContent``
+objects for the ``api`` planner. These parts follow the task and selected memory
+in their supplied order, preserving image bytes and metadata. Other planners do
+not accept this argument. Skills, memory, and observations use the same
+``rpent.data_convert.convert_planner_input`` function as CLI and Dashboard runs; see
+:ref:`planner-context` for direct use of the structured bundle.
+
+Configured delegates
+--------------------
+
+Install ``pip install -e ".[runtime]"`` and pass a ``RuntimeConfig`` to the
+``api`` agent. The existing ``run`` arguments continue to describe the parent:
+
+.. code-block:: python
+
+   from rpent.runtime import RuntimeConfig, SubAgentConfig
+
+   agent = EmbodiedAgent(
+       mcp_servers=[McpServer(name="robot", url="http://127.0.0.1:8000/mcp")],
+       output_dir="runs/episode-001",
+       llm=LLMConfig(provider="openai", model="gpt-5.5"),
+       runtime=RuntimeConfig(subagents={
+           "plan_reviewer": SubAgentConfig(
+               description="Check a proposed robot plan.",
+               instructions="Identify missing prerequisites in the supplied plan.",
+               tools=(),
+           ),
+       }),
+   )
+
+Alternatively, use ``runtime=RuntimeConfig.from_file("benchmark/runtime.yaml")``.
+Skill paths in Python configuration follow the caller's working directory; file
+configuration resolves them relative to that file. Children receive explicit
+delegation text rather than the parent's conversation or initial observations.
+Remote MCP action tools remain on the parent. Children can select existing
+artifact/text readers from the supplied catalog and ``read_skill`` backed by
+their own explicit skill directories. See :ref:`planner-runtime` for tool restrictions, model selection,
+shared usage, and CLI/Dashboard configuration. Other planners reject ``runtime``
+before opening MCP connections.
+
+Context policies, on-demand skills, full model configuration and live/offline
+trajectory inspection are described in :doc:`agent_runtime`. These single-agent
+features do not require the ``runtime`` extra. Existing ``skills`` file arguments
+still preload full text; ``runtime.skill_paths`` instead exposes a lazy directory
+catalog. Input-conversion migration names are listed in the same guide.
+
 RoboDojo example
 ----------------
 

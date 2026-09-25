@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -226,6 +227,115 @@ def test_api_success_reports_reply_and_latency(
     assert result.reply == "ok"
     assert result.latency_s is not None and result.latency_s >= 0
     assert result.credential_present is True
+
+
+@pytest.mark.parametrize("status_code", [200, 401])
+def test_full_llm_configuration_probes_its_transport_and_redacts_explicit_key(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    from pydantic_ai import models
+    from pydantic_ai.providers import openai as provider_module
+
+    from rpent.llm.client import LLMConfig
+
+    key = "custom-private-probe-key"
+    requests = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://custom.example/v1/chat/completions"
+        assert request.headers["authorization"] == f"Bearer {key}"
+        body = json.loads(request.content)
+        assert body["model"] == "configured-model"
+        requests.append(request)
+        if status_code == 401:
+            return httpx.Response(
+                401, json={"error": {"message": f"invalid credential {key}"}}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "probe",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "configured-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": f"ok {key}"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    provider_class = provider_module.OpenAIProvider
+    monkeypatch.setattr(
+        provider_module,
+        "OpenAIProvider",
+        lambda **kwargs: provider_class(http_client=client, **kwargs),
+    )
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", True)
+    config = LLMConfig(
+        provider="openai",
+        model="configured-model",
+        api_key=key,
+        base_url="https://custom.example/v1",
+        openai_format="chat",
+    )
+    request = LlmCheckRequest(llm_config=config)
+    try:
+        result = check_llm(request)
+    finally:
+        asyncio.run(client.aclose())
+
+    assert len(requests) == 1
+    assert result.status == (STATUS_OK if status_code == 200 else STATUS_AUTH_FAILED)
+    assert result.model == "openai-chat:configured-model"
+    assert result.base_url == "https://custom.example/v1"
+    assert result.credential_present is True
+    assert result.credential_env is None
+    assert key not in str(result.as_dict())
+    assert key not in repr(request)
+
+
+def test_full_llm_configuration_probe_retains_its_own_short_timeout(monkeypatch):
+    from rpent.llm.client import LLMConfig
+
+    async def never_finishes(*args, **kwargs):
+        await asyncio.sleep(30)
+        return "unreachable"
+
+    monkeypatch.setattr(LLMConfig, "build_model", lambda self: _reply_model())
+    monkeypatch.setattr(check_mod, "_run_api_probe", never_finishes)
+    request = LlmCheckRequest(
+        llm_config=LLMConfig(
+            provider="openai", model="configured", api_key=SENTINEL_KEY
+        ),
+        timeout_s=1,
+    )
+    result = check_llm(request)
+    assert result.status == STATUS_NETWORK_ERROR
+    assert "1s" in result.detail
+
+
+def test_explicit_key_is_redacted_before_diagnostic_detail_truncation(monkeypatch):
+    from rpent.llm.client import LLMConfig
+
+    key = "custom-private-key-crossing-the-detail-boundary"
+    monkeypatch.setattr(
+        LLMConfig,
+        "build_model",
+        lambda self: _raising_model(RuntimeError("a" * 1980 + key)),
+    )
+    result = check_llm(
+        LlmCheckRequest(
+            llm_config=LLMConfig(provider="openai", model="configured", api_key=key)
+        )
+    )
+    assert result.status == STATUS_SDK_ERROR
+    assert key[:6] not in result.detail
+    assert "truncated" in result.detail
 
 
 def test_api_empty_reply_is_a_provider_error_not_a_success(

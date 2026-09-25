@@ -32,7 +32,7 @@ from collections import deque
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent, BinaryContent, ModelSettings, Tool, ToolReturn
 from pydantic_ai.capabilities import ProcessHistory, Thinking
@@ -65,6 +65,9 @@ from rpent.session import EnvState
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.logging import get_logger
 
+if TYPE_CHECKING:
+    from rpent.runtime import RuntimeConfig
+
 logger = get_logger("api_loop")
 
 #: Console-log truncation limits (characters).
@@ -86,6 +89,18 @@ def _user_message_log(message: str | list[str | BinaryContent]) -> str:
     return "\n".join(part if isinstance(part, str) else "[image]" for part in message)
 
 
+def _record_stop(run: Any | None, *, status: str, reason: str) -> None:
+    """Distinguish planner stop boundaries from SDK iterator cleanup cancellation."""
+    from rpent.runtime.trace import current_trace
+
+    recorder = current_trace()
+    if recorder is not None:
+        if run is None:
+            recorder.mark_run_stop(status=status, reason=reason)
+        else:
+            recorder.mark_agent_stop(run.run_id, status=status, reason=reason)
+
+
 class ApiAgentLoop:
     """Planner that runs the tool-calling loop via a pydantic-ai ``Agent``."""
 
@@ -100,6 +115,7 @@ class ApiAgentLoop:
         timeout_s: int | None = None,
         cache_breakpoints: bool = False,
         image_history_groups: int | None = None,
+        runtime: RuntimeConfig | None = None,
         preserve_initial_image_count: int = 0,
         include_image_reader: bool = True,
         require_tool_call: bool = False,
@@ -112,6 +128,7 @@ class ApiAgentLoop:
         self._timeout_s = timeout_s
         self._cache_breakpoints = cache_breakpoints
         self._image_history_groups = image_history_groups
+        self._runtime = runtime
         self._preserve_initial_image_count = preserve_initial_image_count
         self._include_image_reader = include_image_reader
         self._require_tool_call = require_tool_call
@@ -264,6 +281,7 @@ class ApiAgentLoop:
                     async for node in run:
                         if interactive and _inject_pending(run):
                             quit_requested = True
+                            _record_stop(run, status="cancelled", reason="user_quit")
                             break
                         if Agent.is_call_tools_node(node):
                             run_turns += 1
@@ -285,11 +303,13 @@ class ApiAgentLoop:
 
                             if observer.finish_result is not None:
                                 logger.info("FINISH called: %s", observer.finish_result)
+                                _record_stop(run, status="completed", reason="finish")
                                 break
                             if observer.turns >= max_turns:
                                 logger.info(
                                     "reached max_turns=%d. Stopping.", max_turns
                                 )
+                                _record_stop(run, status="limit", reason="max_turns")
                                 break
                         elif Agent.is_end_node(node):
                             ended_without_tool = (
@@ -338,18 +358,20 @@ class ApiAgentLoop:
                     break
                 nxt = await _await_next()
                 if nxt is None:
+                    _record_stop(None, status="cancelled", reason="user_quit")
                     break
                 seed = nxt
                 messages.append({"role": "user", "content": seed})
         except UsageLimitExceeded as e:
             logger.info("usage limit reached: %s", e)
         except Exception as e:  # noqa: BLE001 - surfaced via PlannerResult.error
-            # A later request can fail after earlier responses succeeded in
-            # this run. Preserve their token usage in the episode summary.
-            if active_run is not None and not active_run_counted:
-                usage = active_run.usage if usage is None else usage + active_run.usage
             last_error = _api_error_text(e, no_images=self._no_images)
             logger.error("agent run failed: %s", last_error)
+        finally:
+            # Preserve completed requests on failure or usage-limit exits without
+            # replacing usage already accumulated across interactive runs.
+            if active_run is not None and not active_run_counted:
+                usage = active_run.usage if usage is None else usage + active_run.usage
 
         return PlannerResult(
             finish_result=observer.finish_result,
@@ -439,19 +461,24 @@ class ApiAgentLoop:
 
     def _build_agent(self, system_prompt: str, toolkit: Toolkit) -> Agent:
         """Build an Agent for terminal or Dashboard execution."""
+        from rpent.runtime.factory import build_runtime_agent
+        from rpent.runtime.trace import RuntimeTraceCapability
+
         thinking_effort: str | bool = self._reasoning_effort
         if thinking_effort == "none":
             thinking_effort = False
-        return Agent(
-            self._model,
-            instructions=system_prompt or None,
+        return build_runtime_agent(
+            model=self._model,
+            system_prompt=system_prompt,
             tools=_build_tools(
                 toolkit,
                 no_images=self._no_images,
                 include_image_reader=self._include_image_reader,
             ),
-            model_settings=_build_model_settings(self._model, self._max_tokens),
+            max_tokens=self._max_tokens,
+            runtime=self._runtime,
             capabilities=[
+                RuntimeTraceCapability(),
                 Thinking(effort=thinking_effort),
                 ProcessHistory(
                     processor=partial(
@@ -676,12 +703,19 @@ class _ApiDashboardSession:
                         self._observer.finish_result is not None
                         or self._observer.turns >= self._max_turns
                     ):
+                        finished = self._observer.finish_result is not None
+                        _record_stop(
+                            run,
+                            status="completed" if finished else "limit",
+                            reason="finish" if finished else "max_turns",
+                        )
                         self._control.end()
                         return False
                     if self._pending_prompts:
                         # Dashboard input accepted at this tool boundary starts
                         # a fresh run from the checkpoint captured below.
                         node = await run.next(node)
+                        _record_stop(run, status="completed", reason="message_handoff")
                         break
                     node = await run.next(node)
 

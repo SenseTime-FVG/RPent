@@ -32,8 +32,12 @@ from typing import Any
 from pydantic_ai import BinaryContent
 
 from rpent.dashboard.events import NullDashboardEventSink
+from rpent.data_convert import TextDocument, convert_planner_input
 from rpent.llm import LLMConfig, LLMUsage
 from rpent.planner.base import PlannerResult, build_planner
+from rpent.runtime import RuntimeConfig
+from rpent.runtime.lifecycle import activate_trace, close_toolkit_trace, create_trace
+from rpent.runtime.skills import load_skill
 from rpent.session import EnvState
 from rpent.tools.toolkit import ToolResult
 from rpent.utils.logging import get_logger
@@ -58,6 +62,7 @@ class McpServer:
     cwd: str | None = None
     headers: Mapping[str, str] | None = None
     expose_unprefixed: bool = False
+    tools: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.replace("_", "").isalnum():
@@ -66,6 +71,14 @@ class McpServer:
             raise ValueError("set exactly one of url and command")
         if self.url and not self.url.startswith(("http://", "https://")):
             raise ValueError("MCP server URL must use http:// or https://")
+        if self.tools is not None:
+            if not isinstance(self.tools, (list, tuple)) or any(
+                not isinstance(name, str) or not name.strip() for name in self.tools
+            ):
+                raise ValueError("MCP tools must be a sequence of names")
+            if len(self.tools) != len(set(self.tools)):
+                raise ValueError("MCP tool names must be unique")
+            object.__setattr__(self, "tools", tuple(self.tools))
 
 
 @dataclass(slots=True)
@@ -252,7 +265,16 @@ class _McpToolkit:
                     )
                     await session.initialize()
                     self._sessions[server.name] = session
-                    for tool in (await session.list_tools()).tools:
+                    discovered = (await session.list_tools()).tools
+                    if server.tools is not None:
+                        missing = set(server.tools) - {tool.name for tool in discovered}
+                        if missing:
+                            raise ValueError(
+                                f"unknown MCP tools for {server.name}: {sorted(missing)}"
+                            )
+                    for tool in discovered:
+                        if server.tools is not None and tool.name not in server.tools:
+                            continue
                         public_name = (
                             tool.name
                             if server.expose_unprefixed
@@ -422,6 +444,8 @@ class EmbodiedAgent:
 
     Construct once per evaluation configuration, then call :meth:`run` for
     each episode. The benchmark owns reset, success checks, and scoring.
+    ``runtime`` optionally configures isolated delegates for the API planner;
+    it requires the ``runtime`` installation extra.
     """
 
     mcp_servers: Sequence[McpServer]
@@ -434,6 +458,7 @@ class EmbodiedAgent:
     max_tokens: int = 8192
     planner_timeout_s: int | None = None
     reasoning_effort: str = "none"
+    runtime: RuntimeConfig | None = None
     _run_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -444,6 +469,7 @@ class EmbodiedAgent:
         *,
         system_prompt: str,
         skills: Sequence[str | Path] = (),
+        memory: Sequence[TextDocument] = (),
         initial_context: Sequence[str | BinaryContent] = (),
         output_dir: str | Path | None = None,
     ) -> PlannerResult:
@@ -454,6 +480,9 @@ class EmbodiedAgent:
             system_prompt: Benchmark and robot-specific rules.
             skills: Paths to skill Markdown files. Each file is read fresh for
                 this episode, so task-specific files can change between runs.
+            memory: Selected, authorized memory excerpts with optional source
+                identifiers. Appended to the task as reference context, not
+                system instructions. No memory files are read automatically.
             initial_context: Text and images placed after the task in the first
                 user message. A stable prefix can be reused by prompt caching.
             output_dir: Optional per-episode artifact directory. Defaults to
@@ -467,6 +496,7 @@ class EmbodiedAgent:
             task,
             system_prompt=system_prompt,
             skills=skills,
+            memory=memory,
             initial_context=initial_context,
             output_dir=output_dir,
         )
@@ -478,6 +508,7 @@ class EmbodiedAgent:
         system_prompt: str,
         deferred_tools: Sequence[str],
         skills: Sequence[str | Path] = (),
+        memory: Sequence[TextDocument] = (),
         initial_context: Sequence[str | BinaryContent] = (),
         output_dir: str | Path | None = None,
         include_finish: bool = False,
@@ -496,6 +527,7 @@ class EmbodiedAgent:
                     task,
                     system_prompt=system_prompt,
                     skills=skills,
+                    memory=memory,
                     initial_context=initial_context,
                     output_dir=output_dir,
                     bridge=bridge,
@@ -523,12 +555,23 @@ class EmbodiedAgent:
         skills: Sequence[str | Path],
         initial_context: Sequence[str | BinaryContent],
         output_dir: str | Path | None,
+        memory: Sequence[TextDocument] = (),
         bridge: _ToolBridge | None = None,
         deferred_tools: Sequence[str] = (),
         include_finish: bool = True,
     ) -> PlannerResult:
         if self.planner not in {"api", "claude_code", "codex"}:
             raise ValueError(f"unsupported embodied planner: {self.planner}")
+        if self.runtime is not None and self.planner != "api":
+            raise ValueError("runtime is supported only by the api planner")
+        if self.runtime is not None:
+            self.runtime.validate_resources()
+            if self.runtime.llm is not None and (
+                self.llm is not None
+                or self.model is not None
+                or self.base_url is not None
+            ):
+                raise ValueError("pass runtime.llm or llm/model/base_url, not both")
         if self.llm is not None and self.planner != "api":
             raise ValueError("llm is supported only by the api planner")
         if initial_context and self.planner != "api":
@@ -544,16 +587,15 @@ class EmbodiedAgent:
             raise ValueError("MCP server names must be unique")
         if not task.strip() or not system_prompt.strip():
             raise ValueError("task and system_prompt must be non-empty")
-        if any(not isinstance(part, (str, BinaryContent)) for part in initial_context):
-            raise TypeError("initial_context parts must be text or BinaryContent")
         if self.max_turns < 1:
             raise ValueError("max_turns must be positive")
-        sections = [system_prompt]
-        for path in skills:
-            skill = Path(path)
-            title = skill.parent.name if skill.name == "SKILL.md" else skill.stem
-            sections.append(f"## Skill: {title}\n\n{skill.read_text(encoding='utf-8')}")
-        prompt = "\n\n".join(sections)
+        context = convert_planner_input(
+            prompt=system_prompt,
+            query=task,
+            memory=memory,
+            skills=[load_skill(path) for path in skills],
+            initial_context=initial_context,
+        )
         output = Path(output_dir if output_dir is not None else self.output_dir)
         output.mkdir(parents=True, exist_ok=True)
         if not self._run_lock.acquire(blocking=False):
@@ -565,8 +607,9 @@ class EmbodiedAgent:
             deferred_tools=deferred_tools,
             include_finish=include_finish,
         )
+        trace = None
+        result = None
         try:
-            toolkit.start()
             planner = build_planner(
                 self.planner,
                 output_dir=output,
@@ -579,19 +622,29 @@ class EmbodiedAgent:
                 planner_timeout_s=self.planner_timeout_s,
                 reasoning_effort=self.reasoning_effort,
                 dashboard_events=NullDashboardEventSink(),
+                runtime=self.runtime,
                 include_image_reader=False,
                 require_tool_call=bridge is not None,
             )
-            result = planner.solve(
-                system_prompt=prompt,
-                user_message=[task, *initial_context] if initial_context else task,
-                toolkit=toolkit,
-                max_turns=self.max_turns,
+            trace = create_trace(
+                output, self.runtime, NullDashboardEventSink(), toolkit=toolkit
             )
+            toolkit.start()
+            with activate_trace(trace):
+                result = planner.solve(
+                    system_prompt=context.system_prompt,
+                    user_message=context.user_message,
+                    toolkit=toolkit,
+                    max_turns=self.max_turns,
+                )
             result.stats["llm_usage"] = LLMUsage.from_planner_stats(
                 result.stats
             ).as_dict()
             return result
         finally:
-            toolkit.close()
-            self._run_lock.release()
+            try:
+                close_toolkit_trace(
+                    toolkit, trace, error=result.error if result is not None else None
+                )
+            finally:
+                self._run_lock.release()

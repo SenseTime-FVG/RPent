@@ -137,6 +137,74 @@ LLM 请求遇到 HTTP 408、409、425、429、5xx，或没有 HTTP 状态码的
 不会自动加载工作目录中的文件。本地 ``finish`` 工具把 agent 的结论写入
 ``PlannerResult.finish_result``；评测得分应以 benchmark 的成功条件为准。
 
+指定 memory 与初始观测
+----------------------
+
+通过 ``memory`` 传入已经筛选好的历史经验。每个 ``TextDocument`` 保留
+标题、正文，以及可选的来源标识：
+
+.. code-block:: python
+
+   from rpent.data_convert import TextDocument
+
+   result = agent.run(
+       "Place the red block in the bowl.",
+       system_prompt="Use the registered robot tools and inspect each result.",
+       skills=["benchmark/SKILL.md"],
+       memory=[TextDocument(
+           title="Top grasp",
+           text="Approach this object from above; recheck its current pose.",
+           source="memory/grasp.md",
+       )],
+   )
+
+Memory 以带标题的参考文本追加到任务后；提供 ``source`` 时也会显示来源。
+它不会加入 ``system_prompt``。调用方负责筛选这些内容并确认其访问权限；
+``source`` 仅用于记录来源，组装函数不会读取该位置。现有机器人流程的
+memory 访问与合并规则保持不变。
+
+``api`` planner 的 ``initial_context`` 支持文本和 PydanticAI
+``BinaryContent`` 对象组成的序列。这些内容按传入顺序放在任务和所选 memory
+之后，保留图像字节及其元数据。其他 planner 不支持此参数。Skill、memory
+和观测统一通过 ``rpent.data_convert.convert_planner_input`` 组装，CLI 和 Dashboard
+也使用这个函数。直接使用结构化结果的方法见 :ref:`planner-context`。
+
+配置子 agent
+------------
+
+安装 ``pip install -e ".[runtime]"`` 后，可以向 ``api`` agent 传入
+``RuntimeConfig``。现有 ``run`` 参数仍用于配置主 agent：
+
+.. code-block:: python
+
+   from rpent.runtime import RuntimeConfig, SubAgentConfig
+
+   agent = EmbodiedAgent(
+       mcp_servers=[McpServer(name="robot", url="http://127.0.0.1:8000/mcp")],
+       output_dir="runs/episode-001",
+       llm=LLMConfig(provider="openai", model="gpt-5.5"),
+       runtime=RuntimeConfig(subagents={
+           "plan_reviewer": SubAgentConfig(
+               description="检查拟执行的机器人计划。",
+               instructions="指出给定计划中遗漏的必要前提。",
+               tools=(),
+           ),
+       }),
+   )
+
+也可使用 ``runtime=RuntimeConfig.from_file("benchmark/runtime.yaml")``。
+Python 配置中的 skill 路径按调用方工作目录解析；文件配置中的路径相对于配置
+文件解析。子 agent 接收显式委派的任务文本，不自动接收父级会话或初始观测。
+远程 MCP 动作工具由主 agent 使用；子 agent 可选择实际存在于工具目录中的
+artifact／文本读取工具，以及绑定自己显式技能目录的 ``read_skill``。
+工具限制、模型选择、共享 usage 和 CLI/Dashboard
+用法见 :ref:`planner-runtime`。其他 planner 会在连接 MCP 之前拒绝 ``runtime``。
+
+逐轮 context 策略、按需技能、完整模型配置与实时／离线轨迹查看见
+:doc:`agent_runtime`。这些单 agent 功能不需要 ``runtime`` extra。既有
+``skills`` 文件参数仍全文预加载；``runtime.skill_paths`` 则提供按需读取的
+目录 catalog。输入转换接口的新旧名称也列在该指南中。
+
 RoboDojo 示例
 -------------
 

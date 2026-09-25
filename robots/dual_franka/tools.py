@@ -361,7 +361,7 @@ class DualFrankaPrimitives(FrankaPrimitives):
         self,
         *,
         env: Any,
-        model: Any | None,
+        model: Any | None = None,
         task_description: str,
         check_cancelled: Callable[[], None],
         sam3_client: Any | None = None,

@@ -154,7 +154,7 @@ class FrankaPrimitives:
         self,
         *,
         env: Any,
-        model: Any | None,
+        model: Any | None = None,
         task_description: str,
         check_cancelled: Callable[[], None],
     ) -> None:

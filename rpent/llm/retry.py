@@ -167,7 +167,7 @@ def _http_error_details(error: Exception | None) -> dict[str, Any] | None:
 class RetryPolicy:
     """Retry transient provider failures; ``max_retries`` excludes the first call."""
 
-    max_retries: int = 2
+    max_retries: int = 3
     initial_delay_s: float = 0.5
     max_delay_s: float = 4.0
 
@@ -304,7 +304,7 @@ class RetryLoggingModel(WrapperModel):
         shape: dict[str, int],
         elapsed_s: float,
         response: ModelResponse | None = None,
-        error: Exception | None = None,
+        error: BaseException | None = None,
     ) -> None:
         if self.request_log_path is None:
             return
@@ -381,41 +381,57 @@ class RetryLoggingModel(WrapperModel):
         request_id = uuid.uuid4().hex
         shape = _request_shape(messages, model_request_parameters)
         shape["max_output_tokens"] = int((model_settings or {}).get("max_tokens") or 0)
-        for attempt in range(1, self.policy.max_retries + 2):
-            started = time.monotonic()
-            try:
-                response = await self.wrapped.request(
-                    messages, model_settings, model_request_parameters
-                )
-                self._record_attempt(
-                    request_id=request_id,
-                    attempt=attempt,
-                    shape=shape,
-                    elapsed_s=time.monotonic() - started,
-                    response=response,
-                )
-                return response
-            except Exception as exc:
-                elapsed_s = time.monotonic() - started
-                self._record_attempt(
-                    request_id=request_id,
-                    attempt=attempt,
-                    shape=shape,
-                    elapsed_s=elapsed_s,
-                    error=exc,
-                )
-                can_retry = _retryable(exc) and attempt <= self.policy.max_retries
-                delay = self._failed(
-                    exc,
-                    attempt,
-                    can_retry=can_retry,
-                    request_id=request_id,
-                    shape=shape,
-                    elapsed_s=elapsed_s,
-                )
-                if not can_retry:
-                    raise
-                await asyncio.sleep(delay)
+        trace = _RequestTrace(
+            self, request_id, messages, model_settings, model_request_parameters
+        )
+        try:
+            for attempt in range(1, self.policy.max_retries + 2):
+                started = time.monotonic()
+                trace.attempt_start(attempt)
+                try:
+                    response = await self.wrapped.request(
+                        messages, model_settings, model_request_parameters
+                    )
+                except BaseException as exc:
+                    elapsed_s = time.monotonic() - started
+                    self._record_attempt(
+                        request_id=request_id,
+                        attempt=attempt,
+                        shape=shape,
+                        elapsed_s=elapsed_s,
+                        error=exc,
+                    )
+                    trace.attempt_end(attempt, elapsed_s, error=exc)
+                    if not isinstance(exc, Exception):
+                        raise
+                    can_retry = _retryable(exc) and attempt <= self.policy.max_retries
+                    delay = self._failed(
+                        exc,
+                        attempt,
+                        can_retry=can_retry,
+                        request_id=request_id,
+                        shape=shape,
+                        elapsed_s=elapsed_s,
+                    )
+                    if not can_retry:
+                        raise
+                    trace.retry(attempt, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    elapsed_s = time.monotonic() - started
+                    self._record_attempt(
+                        request_id=request_id,
+                        attempt=attempt,
+                        shape=shape,
+                        elapsed_s=elapsed_s,
+                        response=response,
+                    )
+                    trace.attempt_end(attempt, elapsed_s, response=response)
+                    trace.end()
+                    return response
+        except BaseException as error:
+            trace.end(error)
+            raise
         raise AssertionError("unreachable retry state")
 
     @asynccontextmanager
@@ -430,50 +446,213 @@ class RetryLoggingModel(WrapperModel):
         request_id = uuid.uuid4().hex
         shape = _request_shape(messages, model_request_parameters)
         shape["max_output_tokens"] = int((model_settings or {}).get("max_tokens") or 0)
-        for attempt in range(1, self.policy.max_retries + 2):
-            opened = False
-            started = time.monotonic()
-            try:
-                async with self.wrapped.request_stream(
-                    messages, model_settings, model_request_parameters, run_context
-                ) as stream:
-                    opened = True
-                    yield stream
+        trace = _RequestTrace(
+            self, request_id, messages, model_settings, model_request_parameters
+        )
+        try:
+            for attempt in range(1, self.policy.max_retries + 2):
+                opened = False
+                stream = None
+                started = time.monotonic()
+                trace.attempt_start(attempt)
                 try:
-                    response = stream.get()
-                except Exception:  # noqa: BLE001 - logging must not fail a completed stream
-                    response = None
-                self._record_attempt(
-                    request_id=request_id,
-                    attempt=attempt,
-                    shape=shape,
-                    elapsed_s=time.monotonic() - started,
-                    response=response,
-                )
-                return
-            except Exception as exc:
-                elapsed_s = time.monotonic() - started
-                self._record_attempt(
-                    request_id=request_id,
-                    attempt=attempt,
-                    shape=shape,
-                    elapsed_s=elapsed_s,
-                    error=exc,
-                )
-                can_retry = (
-                    not opened
-                    and _retryable(exc)
-                    and attempt <= self.policy.max_retries
-                )
-                delay = self._failed(
-                    exc,
-                    attempt,
-                    can_retry=can_retry,
-                    request_id=request_id,
-                    shape=shape,
-                    elapsed_s=elapsed_s,
-                )
-                if not can_retry:
-                    raise
-                await asyncio.sleep(delay)
+                    async with self.wrapped.request_stream(
+                        messages, model_settings, model_request_parameters, run_context
+                    ) as stream:
+                        opened = True
+                        yield (
+                            _TracedStream(stream, trace, attempt)
+                            if trace.recorder is not None
+                            else stream
+                        )
+                except BaseException as exc:
+                    elapsed_s = time.monotonic() - started
+                    # get() includes partial provider-reported usage even when
+                    # consumption or stream cleanup failed. Never replay it.
+                    response = _stream_response(stream)
+                    self._record_attempt(
+                        request_id=request_id,
+                        attempt=attempt,
+                        shape=shape,
+                        elapsed_s=elapsed_s,
+                        response=response,
+                        error=exc,
+                    )
+                    trace.attempt_end(attempt, elapsed_s, response=response, error=exc)
+                    if not isinstance(exc, Exception):
+                        raise
+                    can_retry = (
+                        not opened
+                        and _retryable(exc)
+                        and attempt <= self.policy.max_retries
+                    )
+                    delay = self._failed(
+                        exc,
+                        attempt,
+                        can_retry=can_retry,
+                        request_id=request_id,
+                        shape=shape,
+                        elapsed_s=elapsed_s,
+                    )
+                    if not can_retry:
+                        raise
+                    trace.retry(attempt, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    response = _stream_response(stream)
+                    elapsed_s = time.monotonic() - started
+                    self._record_attempt(
+                        request_id=request_id,
+                        attempt=attempt,
+                        shape=shape,
+                        elapsed_s=elapsed_s,
+                        response=response,
+                    )
+                    trace.attempt_end(attempt, elapsed_s, response=response)
+                    trace.end()
+                    return
+        except BaseException as error:
+            trace.end(error)
+            raise
         raise AssertionError("unreachable retry state")
+
+
+def _stream_response(stream: StreamedResponse | None) -> ModelResponse | None:
+    if stream is not None:
+        try:
+            return stream.get()
+        except Exception:  # noqa: BLE001 - recording cannot replace the provider error
+            pass
+    return None
+
+
+class _TracedStream:
+    """Observe a requested stream without enabling streaming on nonstreaming agents."""
+
+    def __init__(
+        self, wrapped: StreamedResponse, trace: _RequestTrace, attempt: int
+    ) -> None:
+        self._wrapped = wrapped
+        self._trace = trace
+        self._attempt = attempt
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        async for event in self._wrapped:
+            reference = self._trace.recorder.snapshot("chunks", uuid.uuid4().hex, event)
+            self._trace._emit(
+                "model_response_chunk", {"chunk_ref": reference}, attempt=self._attempt
+            )
+            yield event
+
+
+class _RequestTrace:
+    """Correlate attempt records without adding mutable state to shared models."""
+
+    def __init__(
+        self,
+        model: RetryLoggingModel,
+        request_id: str,
+        messages: list[ModelMessage],
+        settings: ModelSettings | None,
+        parameters: ModelRequestParameters,
+    ) -> None:
+        from rpent.runtime.trace import current_trace, current_trace_scope
+
+        self.recorder = current_trace()
+        self.request_id = request_id
+        self.scope = current_trace_scope()
+        self.model = model.model_name
+        self.provider = model.system
+        self.response_ref: str | None = None
+        if self.recorder is not None:
+            if self.scope.turn_id is not None:
+                self._emit(
+                    "context_end",
+                    {"message_count": len(messages), "status": "completed"},
+                )
+            reference = self.recorder.snapshot(
+                "requests",
+                request_id,
+                {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "messages": messages,
+                    "model_settings": settings,
+                    "model_request_parameters": parameters,
+                },
+            )
+            self._emit("model_request_start", {"request_ref": reference})
+
+    def _emit(
+        self, kind: str, payload: dict[str, Any], *, attempt: int | None = None
+    ) -> None:
+        if self.recorder is not None:
+            self.recorder.emit(
+                kind,
+                {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "purpose": self.scope.purpose,
+                    **payload,
+                },
+                request_id=self.request_id,
+                attempt=attempt,
+                agent_id=self.scope.agent_id,
+                parent_agent_id=self.scope.parent_agent_id,
+                turn_id=self.scope.turn_id,
+                tool_call_id=self.scope.tool_call_id,
+            )
+
+    def attempt_start(self, attempt: int) -> None:
+        self._emit("model_attempt_start", {}, attempt=attempt)
+
+    def attempt_end(
+        self,
+        attempt: int,
+        elapsed_s: float,
+        *,
+        response: ModelResponse | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if self.recorder is None:
+            return
+        from rpent.runtime.trace import exception_status, reported_usage
+
+        if response is not None:
+            self.response_ref = self.recorder.snapshot(
+                "responses", f"{self.request_id}-{attempt}", response
+            )
+            self._emit(
+                "message_received",
+                {"source": "model", "message_ref": self.response_ref},
+                attempt=attempt,
+            )
+        self._emit(
+            "model_attempt_end",
+            {
+                "status": exception_status(error) if error is not None else "completed",
+                "elapsed_s": elapsed_s,
+                "error_type": type(error).__name__ if error is not None else None,
+                "usage": reported_usage(response),
+                "response_ref": self.response_ref,
+            },
+            attempt=attempt,
+        )
+
+    def retry(self, attempt: int, delay: float) -> None:
+        self._emit("model_retry", {"retry_delay_s": delay}, attempt=attempt)
+
+    def end(self, error: BaseException | None = None) -> None:
+        from rpent.runtime.trace import exception_status
+
+        self._emit(
+            "model_request_end",
+            {
+                "status": exception_status(error) if error is not None else "completed",
+                "response_ref": self.response_ref,
+                "error_type": type(error).__name__ if error is not None else None,
+            },
+        )

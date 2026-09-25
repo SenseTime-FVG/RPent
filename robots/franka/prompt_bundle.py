@@ -25,6 +25,20 @@ from rpent.prompt.utils import Numbered, PromptNode
 
 def system_prompt(variables: Mapping[str, object] | None = None) -> PromptNode:
     """Assemble the Franka system prompt."""
+    if not (variables or {}).get("enable_vla", True):
+        return {
+            "ROLE": system_parts.ROLE,
+            "RUNTIME": system_parts.RUNTIME,
+            "SAFETY RULES": Numbered(system_parts.RULES),
+            "CONTROL": (
+                "VLA is disabled. Use only exposed bounded tools. Inspect the "
+                "initial state, plan conservatively, and check every motion. "
+                "If the task needs an unavailable learned grasp capability, "
+                "stop and report the limitation; do not improvise contact "
+                "motions or start a model service. Finish only with consistent "
+                "visible evidence."
+            ),
+        }
     return {
         "ROLE": system_parts.ROLE,
         "RUNTIME": system_parts.RUNTIME,

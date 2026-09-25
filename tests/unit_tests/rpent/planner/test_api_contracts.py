@@ -46,6 +46,7 @@ from rpent.planner.api_loop import (
     _make_tool_function,
     _prune_history_images,
 )
+from rpent.runtime import RuntimeConfig, SubAgentConfig
 from rpent.tools.toolkit import ToolResult
 
 
@@ -112,6 +113,156 @@ def solve_with_model(
         toolkit=toolkit,
         max_turns=3,
     )
+
+
+def test_configured_delegate_returns_to_parent_before_finish() -> None:
+    def model(messages, info):
+        if info.instructions == "CHILD":
+            assert info.function_tools == []
+            return ModelResponse(parts=[TextPart("grasp from above")])
+        returned = [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        if not returned:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "delegate_task",
+                        {"agent_name": "reviewer", "task": "Choose a grasp"},
+                        "delegate",
+                    )
+                ]
+            )
+        assert returned[0].content == "grasp from above"
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "finish",
+                    {"status": "success", "summary": returned[0].content},
+                    "finish",
+                )
+            ]
+        )
+
+    toolkit = FakeToolkit()
+    planner = ApiAgentLoop(
+        FunctionModel(model),
+        dashboard_events=RecordingSink(),
+        runtime=RuntimeConfig(
+            subagents={"reviewer": SubAgentConfig(instructions="CHILD")}
+        ),
+    )
+    result = planner.solve(
+        system_prompt="ROOT", user_message="Task", toolkit=toolkit, max_turns=10
+    )
+    assert result.error is None
+    assert result.finish_result["summary"] == "grasp from above"
+    assert result.stats["requests"] == 3
+    assert toolkit.calls == [
+        ("finish", {"status": "success", "summary": "grasp from above"})
+    ]
+
+
+def test_delegate_requests_share_limit_and_preserve_usage_on_exhaustion() -> None:
+    calls = []
+
+    def model(messages, info):
+        calls.append(info.instructions)
+        if info.instructions == "CHILD":
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "read_image", {"name": "absent.png"}, f"read-{len(calls)}"
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "delegate_task",
+                    {"agent_name": "reader", "task": "Read"},
+                    "delegate",
+                )
+            ]
+        )
+
+    planner = ApiAgentLoop(
+        FunctionModel(model),
+        dashboard_events=RecordingSink(),
+        runtime=RuntimeConfig(
+            subagents={
+                "reader": SubAgentConfig(instructions="CHILD", tools=("read_image",))
+            }
+        ),
+    )
+    result = planner.solve(
+        system_prompt="ROOT", user_message="Task", toolkit=FakeToolkit(), max_turns=2
+    )
+    assert len(calls) == 3
+    assert result.stats["requests"] == 3
+    assert result.finish_result is None
+
+
+def test_planner_timeout_drains_delegate_before_toolkit_cleanup() -> None:
+    child_started = []
+    child_exited = []
+
+    async def model(messages, info):
+        if info.instructions == "CHILD":
+            child_started.append(True)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                child_exited.append(True)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "delegate_task",
+                    {"agent_name": "reader", "task": "Read"},
+                    "delegate",
+                )
+            ]
+        )
+
+    class TimeoutToolkit(FakeToolkit):
+        def cancel_active_and_wait(self):
+            assert child_exited == [True]
+            super().cancel_active_and_wait()
+
+    toolkit = TimeoutToolkit()
+    planner = ApiAgentLoop(
+        FunctionModel(model),
+        dashboard_events=RecordingSink(),
+        timeout_s=0.2,
+        runtime=RuntimeConfig(
+            subagents={"reader": SubAgentConfig(instructions="CHILD")}
+        ),
+    )
+    result = planner.solve(
+        system_prompt="ROOT", user_message="Task", toolkit=toolkit, max_turns=10
+    )
+    assert child_started == [True]
+    assert child_exited == [True]
+    assert "timed out" in result.error
+    assert toolkit.cancel_calls == 1
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude_code", "flash"])
+def test_non_api_planner_rejects_runtime_before_construction(tmp_path, backend):
+    from rpent.planner.base import build_planner
+
+    with pytest.raises(ValueError, match="runtime.*api"):
+        build_planner(
+            backend,
+            output_dir=tmp_path,
+            recipe_tag="test",
+            robot_name="test",
+            dashboard_events=RecordingSink(),
+            runtime=RuntimeConfig(),
+        )
 
 
 def test_successful_finish_waits_for_its_tool_result() -> None:

@@ -17,6 +17,7 @@ const COPY = {
   en: {
     pageTitle: "RPent · Live Monitor",
     liveMonitor: "Live Monitor",
+    trajectory: "Trajectory",
     planner: "planner",
     model: "model",
     defaultModel: "configured default",
@@ -119,6 +120,7 @@ const COPY = {
   "zh-cn": {
     pageTitle: "RPent · 实时监控",
     liveMonitor: "实时监控",
+    trajectory: "执行轨迹",
     planner: "planner",
     model: "model",
     defaultModel: "默认配置",

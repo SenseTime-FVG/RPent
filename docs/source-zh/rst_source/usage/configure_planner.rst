@@ -75,6 +75,68 @@ SDK。
 - ``--no-images`` —— 不向模型发送图片字节；纯文本模型必须加此参数。此时
   智能体只依赖文本状态推理，任务表现可能不够理想。
 
+.. _planner-runtime:
+
+配置子 agent
+~~~~~~~~~~~~
+
+``api`` runtime 支持 context 策略、按需技能和轨迹记录，完整配置与离线样例
+见 :doc:`agent_runtime`。安装可选 ``runtime`` 依赖后，还可将任务委派给指定的
+PydanticAI agent：
+
+.. code-block:: bash
+
+   pip install -e ".[runtime]"
+   rpent --robot libero --planner api --model openai:gpt-5.5 \
+     --runtime-config benchmark/runtime.yaml --suite libero_goal_task --task 1
+
+配置支持 YAML 和 JSON，例如：
+
+.. code-block:: yaml
+
+   subagents:
+     scene_analyst:
+       description: 分析已记录的观测。
+       instructions: 根据指定 step 的观测，报告可见事实和不确定项。
+       skills: [skills/scene-analysis/SKILL.md]
+       tools: [read_image]
+     plan_reviewer:
+       description: 检查拟执行的动作计划。
+       instructions: 检查给定计划是否遗漏必要前提。
+       tools: []
+
+运行前需创建引用的 skill 文件。``skills`` 路径相对于配置文件所在目录解析，
+每次 planner 会话都会重新读取。只加载显式声明的 agent，不自动发现项目或
+用户目录中的 agent 定义。省略 ``--runtime-config`` 时保持单 agent 行为；
+其他 planner 会拒绝这个参数。
+
+主 agent 获得 ``delegate_task(agent_name, task)`` 工具。每次调用都会创建独立
+的子会话，并返回文本结果。委派任务必须提供完整信息：父级的 query、memory
+片段、初始图片和会话历史不会自动复制。子 agent 可使用显式列出且实际存在于
+父级工具目录中的 ``read_image``、``read_text_file``、``list_dir``，以及绑定
+自己显式 ``skill_paths`` 目录的 ``read_skill``，继续遵守
+现有读取权限。``read_image`` 读取已记录的 step artifact；只传文本路径不会
+把图片发送给子 agent。机器人动作和 ``finish`` 由主 agent 调用。
+
+省略 ``model`` 时，子 agent 继承主 agent 已配置的模型、端点和重试策略。
+也可配置完整 ``llm``，它与 ``model`` 互斥。
+显式指定带提供商前缀的 ``model`` 时，使用该提供商的环境凭据和端点，不继承
+父级显式传入的 ``--base-url`` 或 ``LLMConfig.api_key``。输出 token 上限、
+thinking 设置和历史图片处理方式继承自 planner；显式子级 ``llm`` 使用自身
+的图像保留配置。
+
+独立的子 agent 模型调用可以并行，共享 RPent 工具集的调用仍串行执行；委派工具
+本身不占用工具执行槽。子 agent 共享父级 usage 和请求限制：现有 SDK 的
+``max_turns + 1`` 请求阈值计入本次运行中父子 agent 的请求。SDK 在发起请求前
+检查已记录的 usage；并行处理中尚未计入的请求可能使最终次数超过该阈值。Token 和请求数
+统计包含子 agent；``turns_used`` 和 ``tool_calls`` 仍描述父级循环。Transcript
+记录父级的委派调用及其结果；full runtime trace 另外保存完整子会话。
+现有 planner 中断和超时机制
+也适用于委派任务。
+
+此 extra 使用 ``pydantic-ai-harness>=0.34,<0.35``，其核心依赖要求
+``pydantic-ai-slim>=2.44.0``。基础单 agent 安装不要求 harness 包。
+
 .. _planner-claude-code:
 
 ``claude_code`` planner
@@ -282,6 +344,53 @@ agent SDK，可以实现 ``rpent.planner.base.Planner`` 协议，并在
 工具或环境服务。接口参见
 :doc:`../development/architecture`；想给
 自定义 planner 暴露新工具，见 :doc:`../development/add_primitive`。
+
+.. _planner-context:
+
+转换 planner 输入
+-----------------
+
+``rpent.data_convert`` 提供 CLI、Dashboard 和 ``EmbodiedAgent`` 共用的初始输入
+转换入口。它分别保留已渲染的 prompt、当前 query、选定的 memory、已解析的
+skill 和初始观测，最后适配为现有 planner 参数：
+
+.. code-block:: python
+
+   from rpent.data_convert import TextDocument, convert_planner_input
+   from rpent.runtime.skills import load_skill
+
+   context = convert_planner_input(
+       prompt="Use the registered robot tools.",
+       query="Place the block in the bowl.",
+       memory=[TextDocument("Grasp", "Recheck the object pose.", "memory/grasp.md")],
+       skills=[load_skill("benchmark/SKILL.md")],
+   )
+   result = planner.solve(
+       system_prompt=context.system_prompt,
+       user_message=context.user_message,
+       toolkit=toolkit,
+       max_turns=100,
+   )
+
+``convert_planner_input`` 不负责读取来源。机器人的 prompt 工厂仍通过
+``PromptBundle`` 渲染模板。``load_skill`` 显式读取一个 UTF-8 文件，不自动
+发现 skill，也不解析 frontmatter；文件读取和解码错误会直接抛出。文件名为
+``SKILL.md`` 时使用父目录名作为标题，其他文件使用不含扩展名的文件名。
+
+``PlannerInput`` 保留 ``prompt``、``query``、``memory``、``skills`` 和
+``initial_context``；memory 和 skill 文档保留各自的 ``source``。输入集合
+会复制为元组，便于跨次运行复用。System 参数由 prompt 和 skill 段落组成；
+user 参数由 query、memory 参考文本和初始观测依次组成。图像对象原样传递。
+没有初始观测时，``user_message`` 仍为字符串；有初始观测时，每次生成新的
+内容列表。
+
+组装过程保留原始文本、顺序和现有 SDK 适配行为。``api`` planner 将
+``system_prompt`` 用作 agent instructions；Codex 和 Claude Code 当前会把
+它与首条 user message 合并。组装函数不改变这一角色映射，也不授予工具权限。
+对话历史、图像裁剪、缓存和上下文窗口处理仍由 planner 负责；工具 schema
+和执行由 toolkit 负责。Memory 检索由调用方或现有 memory 工具完成，
+转换函数不会自动检索或截断内容。逐轮历史策略由 :doc:`agent_runtime` 提供，
+该指南也包含 ``rpent.context`` 与 ``assemble_context`` 的迁移名称。
 
 设置 planner 的运行限制
 -----------------------

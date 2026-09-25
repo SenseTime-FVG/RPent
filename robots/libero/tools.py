@@ -55,7 +55,7 @@ class LiberoPrimitives:
     def __init__(
         self,
         env: LiberoEnvClient,
-        model: Pi05VLAClient,
+        model: Pi05VLAClient | None,
         sam3_client: Sam3Client,
         check_cancelled: Callable[[], None],
         molmo_client: MolmoClient | None = None,
@@ -150,6 +150,8 @@ class LiberoPrimitives:
 
     def _vlm_chunk(self, instruction: str):
         """One model forward + ``chunk_size`` env steps. Overrides prompt."""
+        if self.model is None:
+            raise RuntimeError("VLA is unavailable; configure a model client")
         self._check_cancelled()
         original_task = self._last_obs.get("task_descriptions")
         try:

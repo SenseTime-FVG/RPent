@@ -1,0 +1,21 @@
+# Use with --runtime-config; credentials come from OPENAI_API_KEY.
+llm:
+  provider: openai
+  model: YOUR_MODEL
+  retry:
+    max_retries: 3
+context:
+  strategy: recent_turns
+  keep_turns: 8
+skill_paths:
+  - ./skills/operation
+skill_max_bytes: 262144
+trace:
+  mode: full
+  capture_video: true
+subagents:
+  reviewer:
+    description: Review the explicitly supplied observation.
+    instructions: Report visible evidence and any missing information.
+    skill_paths: [./skills/review]
+    tools: [read_skill]

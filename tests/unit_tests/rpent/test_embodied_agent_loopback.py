@@ -22,14 +22,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai import BinaryContent
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
 
+from rpent.data_convert import TextDocument
 from rpent.embodied_agent import EmbodiedAgent, McpServer
 from rpent.llm import LLMConfig
 from rpent.planner.base import PlannerResult
 from rpent.planner.utils.http_mcp_server import HttpMcpServer
+from rpent.runtime import RuntimeConfig, SubAgentConfig
 from rpent.tools.toolkit import ToolResult
 
 
@@ -64,8 +67,121 @@ class _RobotTools:
         return ToolResult(name=name, result={"camera": "front", "_image_bytes": b"png"})
 
 
+def test_mcp_allowlist_hides_and_rejects_unselected_tools(tmp_path: Path) -> None:
+    from rpent.embodied_agent import _McpToolkit
+
+    robot = _RobotTools()
+    server = HttpMcpServer(robot)
+    server.start()
+    toolkit = _McpToolkit(
+        [McpServer(name="robot", url=server.url, tools=("snapshot",))], tmp_path
+    )
+    try:
+        toolkit.start()
+        assert {item["name"] for item in toolkit.get_tools_spec()} == {
+            "robot__snapshot",
+            "finish",
+        }
+        assert (
+            "unknown tool"
+            in toolkit.execute_tool("robot__move_eef", {"pose": "target"}).result[
+                "error"
+            ]
+        )
+        assert not robot.calls
+        toolkit.execute_tool("robot__snapshot", {})
+        assert robot.calls == [("snapshot", {})]
+    finally:
+        toolkit.close()
+        server.stop()
+
+
+def test_embodied_runtime_delegates_before_executing_robot_tool(tmp_path, monkeypatch):
+    from pydantic_ai.messages import (
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+    )
+    from pydantic_ai.models.function import FunctionModel
+
+    from rpent.planner import base
+
+    def model(messages, info):
+        if info.instructions == "CHILD":
+            assert info.function_tools == []
+            return ModelResponse(parts=[TextPart("target")])
+        returned = [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        if not returned:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "delegate_task",
+                        {"agent_name": "reviewer", "task": "Choose a pose"},
+                        "d",
+                    )
+                ]
+            )
+        if len(returned) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "robot__move_eef", {"pose": returned[0].content}, "move"
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "finish", {"status": "success", "summary": "placed"}, "finish"
+                )
+            ]
+        )
+
+    monkeypatch.setattr(base, "build_api_model", lambda *a, **kw: FunctionModel(model))
+    robot = _RobotTools()
+    server = HttpMcpServer(robot)
+    server.start()
+    try:
+        agent = EmbodiedAgent(
+            mcp_servers=[McpServer(name="robot", url=server.url)],
+            output_dir=tmp_path / "episode",
+            model="openai:offline",
+            runtime=RuntimeConfig(
+                subagents={"reviewer": SubAgentConfig(instructions="CHILD")}
+            ),
+        )
+        result = agent.run("Place the block", system_prompt="ROOT")
+    finally:
+        server.stop()
+    assert result.error is None
+    assert result.finish_result["status"] == "success"
+    assert result.stats["requests"] == 4
+    assert robot.calls == [("move_eef", {"pose": "target"})]
+
+
+@pytest.mark.parametrize("planner", ["codex", "claude_code"])
+def test_embodied_runtime_rejected_before_mcp_or_output_creation(tmp_path, planner):
+    output = tmp_path / "unused"
+    agent = EmbodiedAgent(
+        mcp_servers=[McpServer(name="robot", url="http://127.0.0.1:1/mcp")],
+        output_dir=output,
+        planner=planner,
+        runtime=RuntimeConfig(),
+    )
+    with pytest.raises(ValueError, match="runtime.*api"):
+        agent.run("Task", system_prompt="Instructions")
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("with_context", [False, True])
 def test_embodied_agent_discovers_calls_and_preserves_images(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_context: bool
 ) -> None:
     robot = _RobotTools()
     server = HttpMcpServer(robot)
@@ -119,9 +235,21 @@ def test_embodied_agent_discovers_calls_and_preserves_images(
         output_dir=tmp_path / "episode",
         llm=llm,
     )
+    image = BinaryContent(data=b"initial-png", media_type="image/png")
+    context_args = (
+        {
+            "memory": [TextDocument("grasp", "Use the top grasp.", "memory/grasp.md")],
+            "initial_context": ["Initial camera", image],
+        }
+        if with_context
+        else {}
+    )
     try:
         result = agent.run(
-            "Place the block.", system_prompt="Use safe poses.", skills=[skill]
+            "Place the block.",
+            system_prompt="Use safe poses.",
+            skills=[skill],
+            **context_args,
         )
     finally:
         server.stop()
@@ -130,14 +258,40 @@ def test_embodied_agent_discovers_calls_and_preserves_images(
     assert planner_kwargs["llm_config"] is llm
     assert result.stats["llm_usage"]["total_tokens"] == 15
     assert result.stats["llm_usage"]["cache_read_tokens"] == 3
-    assert seen["user_message"] == "Place the block."
-    assert "Use safe poses." in seen["system_prompt"]
-    assert "Use the front camera" in seen["system_prompt"]
+    if with_context:
+        assert seen["user_message"] == [
+            "Place the block.\n\n## Memory: grasp\nSource: memory/grasp.md\n\nUse the top grasp.",
+            "Initial camera",
+            image,
+        ]
+        assert seen["user_message"][2] is image
+    else:
+        assert seen["user_message"] == "Place the block."
+    assert seen["system_prompt"] == (
+        f"Use safe poses.\n\n## Skill: {tmp_path.name}\n\n"
+        "Use the front camera after each motion."
+    )
     assert robot.calls == [
         ("move_eef", {"pose": "target"}),
         ("move_eef", {"pose": "invalid"}),
         ("snapshot", {}),
     ]
+
+
+def test_missing_skill_fails_before_mcp_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject_start(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("MCP must not start before context is loaded")
+
+    monkeypatch.setattr("rpent.embodied_agent._McpToolkit.start", reject_start)
+    agent = EmbodiedAgent(
+        mcp_servers=[McpServer(name="robot", url="http://localhost/mcp")],
+        output_dir=tmp_path / "episode",
+    )
+    with pytest.raises(FileNotFoundError):
+        agent.run("task", system_prompt="rules", skills=[tmp_path / "missing.md"])
+    assert not (tmp_path / "episode").exists()
 
 
 def test_episode_hands_motion_to_benchmark_and_returns_observation(

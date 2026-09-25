@@ -30,7 +30,7 @@ class RoboCasaPrimitives:
         env_client,
         workdir,
         hi_res,
-        vla_client,
+        vla_client=None,
         check_cancelled=None,
         allow_reset: bool | None = None,
     ):
@@ -59,8 +59,10 @@ class RoboCasaPrimitives:
         self._pos_jac = None  # 3x3 action(arm xyz) -> world dpos
         self._fwd_offset = None  # world_forward_heading = base_yaw + offset
         self._cam_meta_cache = {}
-        self._rldx = RLDXSkill(
-            self.env, vla_client=vla_client, check_cancelled=check_cancelled
+        self._rldx = (
+            RLDXSkill(self.env, vla_client=vla_client, check_cancelled=check_cancelled)
+            if vla_client is not None
+            else None
         )
         # "mid-call" desync guard: True whenever a NON-VLA primitive (move/navigate/
         # manual grasp) or a reset has stepped the env since the last rldx_skill call.
@@ -444,6 +446,8 @@ class RoboCasaPrimitives:
         settle_eps,
     ):
         """Execute RLDX with the environment's live, full task language."""
+        if self._rldx is None:
+            raise RuntimeError("VLA is unavailable; configure a VLA client")
         del use_prompt  # Accepted for compatibility with historical task recipes.
         configured_max_chunks = os.environ.get("RLDX_MAX_CHUNKS")
         if configured_max_chunks is not None:
@@ -513,7 +517,8 @@ class RoboCasaPrimitives:
         self.env.reset()
         self._pos_jac = None
         self._fwd_offset = None
-        self._rldx.reset_session()
+        if self._rldx is not None:
+            self._rldx.reset_session()
         return {"ok": True, "reset": True, "eef": self.env.eef_pos.tolist()}
 
     # ---- VLA wrappers (public API for execute) ----

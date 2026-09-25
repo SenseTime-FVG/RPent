@@ -92,6 +92,7 @@ def get_toolkit(
     runtime_kwargs: dict[str, Any],
     dashboard_events: DashboardEventSink,
     config: RunConfig,
+    enable_vla: bool = True,
 ):
     """Return the Franka toolkit."""
     from robots.franka.toolkit import FrankaToolkit
@@ -100,6 +101,7 @@ def get_toolkit(
         root=config.prompt_vars.get("memory_dir") or get_memory_dir("franka"),
     )
     return FrankaToolkit(
+        enable_vla=enable_vla,
         runtime_kwargs=runtime_kwargs,
         dashboard_events=dashboard_events,
         memory=memory,
@@ -138,6 +140,8 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         recipe_tag=f"franka_t{args.task_id}",
         output_dir=output_dir,
         prompt_vars={
+            "enable_vla": getattr(args, "enable_vla", True)
+            and args.vla_endpoint is not None,
             "task_name": task.name,
             "instruction": task.instruction,
             "success_criteria": task.success_criteria,
@@ -218,7 +222,10 @@ def _init_runtime(
     from rpent.robots.components.pi05_vla_client import Pi05VLAClient
 
     available = {"env", "vla"}
-    selected = available if components is None else components
+    selected = set(available if components is None else components)
+    enable_vla = getattr(args, "enable_vla", True)
+    if not enable_vla:
+        selected.discard("vla")
     unknown = selected.difference(available)
     if unknown:
         raise ValueError(f"unknown Franka runtime components: {sorted(unknown)}")
@@ -249,6 +256,8 @@ def _init_runtime(
         )
 
     runtime_kwargs: dict[str, Any] = {}
+    if not enable_vla:
+        runtime_kwargs["model"] = None
     for component, (daemon, rpc) in pending.items():
         component_kwargs = try_wait_server(
             owned_daemons,

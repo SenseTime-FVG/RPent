@@ -36,6 +36,7 @@ class FrankaToolkit(Toolkit):
 
     _tools_module = franka_tools
     _primitives_cls = franka_tools.FrankaPrimitives
+    VLA_TOOLS = frozenset({"vla_grasp"})
 
     def __init__(
         self,
@@ -43,6 +44,7 @@ class FrankaToolkit(Toolkit):
         runtime_kwargs: dict[str, Any],
         dashboard_events: DashboardEventSink,
         memory: MemoryManager,
+        enable_vla: bool = True,
         state_output_dir: Path | str | None = None,
     ) -> None:
         state = EnvState(Path(state_output_dir or get_output_dir()))
@@ -51,6 +53,9 @@ class FrankaToolkit(Toolkit):
             state=state,
             memory=memory,
         )
+        self._enable_vla = enable_vla and runtime_kwargs.get("model") is not None
+        if not self._enable_vla:
+            runtime_kwargs = {**runtime_kwargs, "model": None}
         self._primitives = self._primitives_cls(
             check_cancelled=self.raise_if_cancelled,
             **runtime_kwargs,
@@ -88,6 +93,8 @@ class FrankaToolkit(Toolkit):
         }
         for spec in self._tools_module.TOOLS_SPEC:
             name = spec["name"]
+            if name in self.VLA_TOOLS and not self._enable_vla:
+                continue
             handler = state_handlers.get(name) or getattr(self._primitives, name)
             self.add_tool(name, spec, handler)
 

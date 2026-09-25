@@ -87,6 +87,8 @@ def _world_from_depth(
 class RoboTwinToolkit(Toolkit):
     """Common RPent tools plus RoboTwin primitives."""
 
+    VLA_TOOLS = frozenset({"lingbot_act"})
+
     _SPECS = {spec["name"]: spec for spec in tools.TOOLS_SPEC}
 
     def __init__(
@@ -95,6 +97,7 @@ class RoboTwinToolkit(Toolkit):
         runtime_kwargs: dict[str, Any],
         dashboard_events: DashboardEventSink,
         memory: MemoryManager,
+        enable_vla: bool = True,
         mode: str = "evaluation",
         attempts_per_session: int = 0,
         state_output_dir: Path | str | None = None,
@@ -108,6 +111,9 @@ class RoboTwinToolkit(Toolkit):
             memory=memory,
         )
         self._mode = mode
+        self._enable_vla = enable_vla and runtime_kwargs.get("model") is not None
+        if not self._enable_vla:
+            runtime_kwargs = {**runtime_kwargs, "model": None}
         self._attempt = 1
         self._attempts_per_session = max(0, int(attempts_per_session))
         self._latest_status: dict[str, Any] = {}
@@ -164,6 +170,8 @@ class RoboTwinToolkit(Toolkit):
             "set_gripper",
             "release",
         ):
+            if name in self.VLA_TOOLS and not self._enable_vla:
+                continue
             self.add_tool(name, self._SPECS[name], partial(self._step, name))
         finish_handler = (
             self._guarded_finish if self._mode == "exploration" else self._finish
@@ -270,15 +278,39 @@ class RoboTwinToolkit(Toolkit):
                 "elapsed_s": elapsed_s,
             },
         )
-        if self._dashboard_events.enabled:
+        if self._dashboard_events.enabled or getattr(self, "capture_video", False):
             frames = self._primitives.frame_slice(frame_start)
             if frames:
-                self._state.save(
+                saved = self._state.save(
                     f"action_{command['action']}.mp4",
                     frames,
                     step=record.step_idx,
                     fps=20,
                 )
+                if saved is not None:
+                    clip_path = self._state.artifact_path(saved, step=record.step_idx)
+                    episode_path = self._state.artifact_path("episode.mp4", step=None)
+                    self._state.update_step_extras(
+                        record.step_idx,
+                        {
+                            "videos": [
+                                {
+                                    "video_ref": clip_path.relative_to(
+                                        episode_path.parent
+                                    ).as_posix(),
+                                    "frame_start": 0,
+                                    "frame_end": len(frames),
+                                    "fps": 20,
+                                },
+                                {
+                                    "video_ref": "episode.mp4",
+                                    "frame_start": frame_start,
+                                    "frame_end": self._action_frame_cursor,
+                                    "fps": 20,
+                                },
+                            ],
+                        },
+                    )
         return tools.view_env_state(record.step_idx, state=self._state)
 
     def close(self) -> None:

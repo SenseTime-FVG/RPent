@@ -52,11 +52,13 @@ from rpent.dashboard.events import (
     NullDashboardEventSink,
     RunStartedEvent,
 )
+from rpent.data_convert import convert_planner_input
 from rpent.evaluation import RunFinalizationContext
 from rpent.memory import MemoryManager
 from rpent.planner.base import REASONING_EFFORTS, build_planner
 from rpent.planner.check import BASE_URL_ENV_BY_PLANNER
 from rpent.robots import enumerate_robots, get_robot_spec, get_toolkit
+from rpent.runtime.lifecycle import activate_trace, close_toolkit_trace, create_trace
 from rpent.utils.config import get_memory_dir
 from rpent.utils.logging import get_logger, init_output_dir
 
@@ -94,6 +96,16 @@ def _serialize_messages(messages: list[dict]) -> list[dict]:
         }
         for m in messages
     ]
+
+
+def _configured_model_name(args: argparse.Namespace) -> str | None:
+    """Return the selected model label for transcripts and run metadata."""
+    runtime = getattr(args, "agent_runtime", None)
+    if runtime is not None and runtime.llm is not None:
+        config = runtime.llm
+        provider = "openai-chat" if config.openai_format == "chat" else config.provider
+        return f"{provider}:{config.model}"
+    return args.model
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +164,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument("--max-turns", type=int, default=100)
+    ap.add_argument(
+        "--no-vla",
+        dest="enable_vla",
+        action="store_false",
+        default=True,
+        help="Run supported non-VLA tools without starting or loading a VLA model.",
+    )
+    ap.add_argument(
+        "--runtime-config",
+        default=None,
+        help="YAML/JSON context, skills, model, trace and sub-agent configuration for the api planner.",
+    )
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument(
         "--reasoning-effort",
@@ -307,6 +331,7 @@ def _start_continuation_session(
         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
         dashboard_events=dashboard_events,
         no_images=args.no_images,
+        runtime=getattr(args, "agent_runtime", None),
     )
     system_prompt = prompt_bundle.render(
         "system",
@@ -356,6 +381,21 @@ def main() -> int:
     )
     args = parser.parse_args()
     args.robot_name = early.robot_name
+    args.agent_runtime = None
+    if args.runtime_config is not None:
+        if args.planner != "api":
+            parser.error("--runtime-config requires --planner=api")
+        from rpent.runtime import RuntimeConfig
+
+        try:
+            args.agent_runtime = RuntimeConfig.from_file(args.runtime_config)
+            args.agent_runtime.validate_resources()
+            if args.agent_runtime.llm is not None and (
+                args.model is not None or args.base_url is not None
+            ):
+                parser.error("pass runtime llm or --model/--base-url, not both")
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     human_interactive_exploration = (
         args.explore and robot_spec.supports_human_interactive_exploration
     )
@@ -376,6 +416,8 @@ def main() -> int:
             f"{BASE_URL_ENV_BY_PLANNER[args.planner]} instead"
         )
     if args.planner == "flash":
+        if not args.enable_vla:
+            parser.error("Flash Mode requires VLA; remove --no-vla")
         if args.explore:
             parser.error("Flash Mode is evaluation-only; remove --explore")
         if robot_spec.run_flash is None:
@@ -456,6 +498,7 @@ def main() -> int:
         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
         dashboard_events=dashboard_events,
         no_images=args.no_images,
+        runtime=args.agent_runtime,
     )
     prompt_bundle = robot_spec.prompts
     prompt_vars = {**prompt_vars, "output_dir": output_dir}
@@ -558,6 +601,7 @@ def main() -> int:
                 toolkit = get_toolkit(
                     robot_name,
                     runtime_kwargs=runtime_kwargs,
+                    enable_vla=args.enable_vla,
                     dashboard_events=dashboard_events,
                     config=run_config,
                     mode="exploration" if args.explore else "evaluation",
@@ -575,6 +619,7 @@ def main() -> int:
                 toolkit = get_toolkit(
                     robot_name,
                     runtime_kwargs=runtime_kwargs,
+                    enable_vla=args.enable_vla,
                     dashboard_events=dashboard_events,
                     config=run_config,
                 )
@@ -593,14 +638,23 @@ def main() -> int:
                     return True
 
                 operator_input.bind_verdict(accept_verdict)
+            trace = None
             try:
-                result = planner.solve(
-                    system_prompt=system_prompt,
-                    user_message=session_msg,
+                trace = create_trace(
+                    state_output_dir,
+                    args.agent_runtime,
+                    dashboard_events,
                     toolkit=toolkit,
-                    max_turns=args.max_turns,
-                    input_queue=input_queue,
                 )
+                context = convert_planner_input(prompt=system_prompt, query=session_msg)
+                with activate_trace(trace):
+                    result = planner.solve(
+                        system_prompt=context.system_prompt,
+                        user_message=context.user_message,
+                        toolkit=toolkit,
+                        max_turns=args.max_turns,
+                        input_queue=input_queue,
+                    )
                 finish_result = result.finish_result
                 messages += result.messages
                 stats = result.stats
@@ -632,7 +686,7 @@ def main() -> int:
                         )
                         solved = bool(environment_success)
                 finally:
-                    toolkit.close()
+                    close_toolkit_trace(toolkit, trace, error=agent_error)
             if (
                 solved
                 or (finish_result or {}).get("operator_aborted")
@@ -670,7 +724,7 @@ def main() -> int:
     transcript_path = Path(output_dir) / f"transcript_{recipe_tag}.json"
     record = {
         **task_desc,
-        "model": args.model,
+        "model": _configured_model_name(args),
         "elapsed_s": round(elapsed, 1),
         "finish": finish_result,
         "stats": stats,
@@ -699,7 +753,7 @@ def main() -> int:
                     agent_error=agent_error,
                     elapsed_s=elapsed,
                     planner=args.planner,
-                    model=args.model,
+                    model=_configured_model_name(args),
                     reasoning_effort=args.reasoning_effort,
                     max_turns=args.max_turns,
                     planner_timeout_s=args.planner_timeout_s,

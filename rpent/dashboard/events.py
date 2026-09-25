@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 if TYPE_CHECKING:
@@ -61,12 +62,22 @@ class RunStartedEvent:
     """Mark startup complete and the agent run active."""
 
 
+@dataclass(frozen=True, slots=True)
+class TraceUpdatedEvent:
+    """Notify the live view that persisted trajectory data has changed."""
+
+    output_dir: Path
+    run_id: str
+    last_seq: int
+
+
 DashboardEvent: TypeAlias = (
     TranscriptEvent
     | UsageEvent
     | RuntimeStatusEvent
     | StepRecordEvent
     | RunStartedEvent
+    | TraceUpdatedEvent
 )
 
 

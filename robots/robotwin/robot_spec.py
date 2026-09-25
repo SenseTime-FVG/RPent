@@ -199,6 +199,7 @@ def get_toolkit(
     runtime_kwargs: dict[str, Any],
     dashboard_events: DashboardEventSink,
     config: RunConfig,
+    enable_vla: bool = True,
     mode: str = "evaluation",
     attempts_per_session: int = 0,
     state_output_dir: Path | str | None = None,
@@ -212,6 +213,7 @@ def get_toolkit(
         inbox_cell_tag=config.recipe_tag if mode == "exploration" else None,
     )
     return RoboTwinToolkit(
+        enable_vla=enable_vla,
         runtime_kwargs=runtime_kwargs,
         dashboard_events=dashboard_events,
         memory=memory,
@@ -328,6 +330,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         else f"{args.task_name}_s0"
     )
     prompt_vars = {
+        "enable_vla": getattr(args, "enable_vla", True),
         "task_name": args.task_name,
         "seed": args.seed,
         "task_config": task_config,
@@ -494,7 +497,10 @@ def _init_runtime(
 ) -> tuple[list["ProcessDaemon"], dict[str, Any]]:
     """Initialize every RoboTwin component, or only ``components`` when given."""
     available = {"env", "vla"}
-    selected = available if components is None else components
+    selected = set(available if components is None else components)
+    enable_vla = getattr(args, "enable_vla", True)
+    if not enable_vla:
+        selected.discard("vla")
     unknown = selected.difference(available)
     if unknown:
         raise ValueError(f"unknown RoboTwin runtime components: {sorted(unknown)}")
@@ -524,6 +530,8 @@ def _init_runtime(
             raise RuntimeError(f"[vla] spawn failed: {exc}") from exc
 
     runtime_kwargs: dict[str, Any] = {}
+    if not enable_vla:
+        runtime_kwargs["model"] = None
 
     if env_pending is not None:
         env_daemon, env_rpc = env_pending

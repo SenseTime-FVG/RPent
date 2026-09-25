@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -51,10 +52,14 @@ from rpent.dashboard.state import (
     PrimitiveArgumentError,
     PrimitiveConfigError,
 )
+from rpent.evaluation.trajectory import TrajectoryReader
 from rpent.utils.daemon import pick_free_port
 from rpent.utils.logging import get_logger
 
 logger = get_logger("dashboard_server")
+
+if TYPE_CHECKING:
+    from rpent.llm.client import LLMConfig
 
 
 class DashboardServer:
@@ -70,18 +75,30 @@ class DashboardServer:
         planner: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
+        llm_config: LLMConfig | None = None,
     ) -> None:
         self.host = host
         self.port = int(port)
         self._state = state
+        if llm_config is not None:
+            from rpent.planner.check import LlmCheckRequest
+
+            model = LlmCheckRequest(llm_config=llm_config).resolved_model()
         self._planner_config = {"planner": planner, "model": model}
         # Server-side context the page cannot supply. The check keeps its own
         # short timeouts; the run's is never reused.
         self._llm_check_base_url = base_url
+        self._llm_check_config = llm_config
         self._llm_check_lock = threading.Lock()
+        self._trajectory_lock = threading.RLock()
+        self._trajectory_reader: TrajectoryReader | None = None
+        self._trajectory_identity: tuple[Path | None, str | None, int] | None = None
         dashboard_dir = Path(__file__).parent
         self._language = "zh-cn" if language == "zh-cn" else "en"
         self._index_html = (dashboard_dir / "index.html").read_text(encoding="utf-8")
+        self._trajectory_html = (dashboard_dir / "trajectory.html").read_text(
+            encoding="utf-8"
+        )
         self._static_dir = dashboard_dir / "static"
         self._app = self._build_app()
         self._server: uvicorn.Server | None = None
@@ -105,6 +122,36 @@ class DashboardServer:
 
     # -- routes ------------------------------------------------------------
 
+    def _get_trajectory_reader(
+        self, run_id: str | None, generation: int | None
+    ) -> tuple[TrajectoryReader, tuple[Path | None, str | None, int]]:
+        """Select a cached reader while its caller holds the trajectory lock."""
+        identity = self._state.trajectory_source()
+        directory, current_run, current_generation = identity
+        if (run_id is not None and run_id != current_run) or (
+            generation is not None and generation != current_generation
+        ):
+            raise HTTPException(
+                status_code=409, detail="the selected trajectory has changed"
+            )
+        if directory is None or current_run is None:
+            raise HTTPException(
+                status_code=404, detail="no trajectory is available for this task"
+            )
+        if identity != self._trajectory_identity:
+            self._trajectory_reader = TrajectoryReader(directory)
+            self._trajectory_identity = identity
+        assert self._trajectory_reader is not None
+        return self._trajectory_reader, identity
+
+    def _check_trajectory_identity(
+        self, identity: tuple[Path | None, str | None, int]
+    ) -> None:
+        if self._state.trajectory_source() != identity:
+            raise HTTPException(
+                status_code=409, detail="the selected trajectory has changed"
+            )
+
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="RPent dashboard")
         app.mount(
@@ -118,6 +165,13 @@ class DashboardServer:
             html = self._index_html.replace(
                 "__DASHBOARD_LANGUAGE__",
                 self._language,
+            )
+            return HTMLResponse(html)
+
+        @app.get("/trajectory")
+        def trajectory() -> HTMLResponse:
+            html = self._trajectory_html.replace(
+                "__DASHBOARD_LANGUAGE__", self._language
             )
             return HTMLResponse(html)
 
@@ -145,13 +199,17 @@ class DashboardServer:
                 from rpent.planner.check import LlmCheckRequest, check_llm
 
                 configured = self._planner_config
+                planner = str(
+                    payload.get("planner") or configured.get("planner") or "api"
+                )
                 result = check_llm(
                     LlmCheckRequest(
-                        planner=str(
-                            payload.get("planner") or configured.get("planner") or "api"
-                        ),
+                        planner=planner,
                         model=(payload.get("model") or configured.get("model") or None),
                         base_url=self._llm_check_base_url or None,
+                        # A configured runtime model is authoritative; the browser
+                        # receives only its identity and never supplies credentials.
+                        llm_config=self._llm_check_config if planner == "api" else None,
                     )
                 )
             finally:
@@ -212,6 +270,86 @@ class DashboardServer:
             return JSONResponse(
                 self._state.session_detail(timeline_since=timeline_since)
             )
+
+        @app.get("/api/session/trajectory")
+        def api_trajectory(
+            after_seq: int = Query(default=0, ge=0),
+            run_id: str | None = None,
+            generation: int | None = None,
+        ) -> JSONResponse:
+            with self._trajectory_lock:
+                reader, identity = self._get_trajectory_reader(run_id, generation)
+                try:
+                    data = reader.index(after_seq)
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422, detail=f"cannot read trajectory: {exc}"
+                    ) from exc
+                self._check_trajectory_identity(identity)
+                return JSONResponse(
+                    {**data, "task_generation": identity[2]},
+                    headers={"Cache-Control": "no-store"},
+                )
+
+        @app.get("/api/session/trajectory/turn/{turn_id}")
+        def api_trajectory_turn(
+            turn_id: str, run_id: str | None = None, generation: int | None = None
+        ) -> JSONResponse:
+            with self._trajectory_lock:
+                reader, identity = self._get_trajectory_reader(run_id, generation)
+                try:
+                    reader.update()
+                    data = reader.turn(turn_id)
+                except KeyError as exc:
+                    raise HTTPException(
+                        status_code=404, detail="trajectory turn not found"
+                    ) from exc
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422, detail=f"cannot read trajectory: {exc}"
+                    ) from exc
+                self._check_trajectory_identity(identity)
+                return JSONResponse(
+                    {**data, "run_id": identity[1], "task_generation": identity[2]},
+                    headers={"Cache-Control": "no-store"},
+                )
+
+        @app.get("/api/session/trajectory/artifact")
+        def api_trajectory_artifact(
+            ref: str, run_id: str | None = None, generation: int | None = None
+        ) -> Response:
+            with self._trajectory_lock:
+                reader, identity = self._get_trajectory_reader(run_id, generation)
+                try:
+                    path = reader.artifact_path(ref)
+                except ValueError as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
+                if not path.is_file():
+                    raise HTTPException(
+                        status_code=404, detail="trajectory artifact not found"
+                    )
+                self._check_trajectory_identity(identity)
+                media_type = (
+                    mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                )
+                if media_type not in {
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                    "image/gif",
+                    "video/mp4",
+                    "video/webm",
+                    "application/json",
+                }:
+                    media_type = "application/octet-stream"
+                return FileResponse(
+                    path,
+                    media_type=media_type,
+                    headers={
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
 
         @app.get("/api/session/primitives")
         def api_primitives() -> JSONResponse:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -185,6 +186,12 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
 
     merge_calls: list[dict[str, Any]] = []
     solved_calls = []
+    planner_calls: list[dict[str, Any]] = []
+    from rpent.runtime import RuntimeConfig, SubAgentConfig
+
+    configured_runtime = RuntimeConfig(
+        subagents={"reviewer": SubAgentConfig(instructions="Review the plan.")}
+    )
 
     class FakeMemoryManager:
         def merge_memory(self, **kwargs: Any) -> dict[str, int]:
@@ -232,7 +239,7 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
 
     class FakePlanner:
         def solve(self, **kwargs: Any) -> PlannerResult:
-            del kwargs
+            planner_calls.append(kwargs)
             return PlannerResult(
                 finish_result={"status": "success"},
                 messages=[],
@@ -253,12 +260,15 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
         parse_config=lambda args: run_config,
         init_runtime=lambda *args: ([], {}),
         prompts=PromptBundle(
-            system=lambda variables: "system",
+            system=lambda variables: (
+                f"system for session {variables['session_number']}"
+            ),
             user=lambda variables: "user",
         ),
     )
     args = SimpleNamespace(
         verbose=False,
+        agent_runtime=configured_runtime,
         robot_name="custom_exploration_env",
         explore=True,
         auto_merge_memory=True,
@@ -282,9 +292,12 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
     monkeypatch.setattr(
         dashboard_cli, "get_toolkit", lambda *args, **kwargs: FakeToolkit()
     )
-    monkeypatch.setattr(
-        dashboard_cli, "build_planner", lambda *args, **kwargs: FakePlanner()
-    )
+
+    def build_planner(*args, **kwargs):
+        assert kwargs["runtime"] == configured_runtime
+        return FakePlanner()
+
+    monkeypatch.setattr(dashboard_cli, "build_planner", build_planner)
 
     error = dashboard_cli._run_dashboard_task(
         args=args,
@@ -297,6 +310,20 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
     )
 
     assert error is None
+    trace_manifests = list(
+        (output_dir / "sessions").glob("session_*/trace/manifest.json")
+    )
+    assert len(trace_manifests) == sessions
+    assert all(
+        json.loads(path.read_text())["status"] == "completed"
+        for path in trace_manifests
+    )
+    assert planner_calls[0]["user_message"] == "user\n"
+    assert [call["system_prompt"] for call in planner_calls] == [
+        f"system for session {number}\n" for number in range(1, sessions + 1)
+    ]
+    if sessions == 2:
+        assert planner_calls[1]["user_message"].startswith("You are agent 2 of up to 2")
     assert state.toolkit_lifecycle == ["bound", "unbound"] * sessions
     assert merge_calls == [
         {

@@ -47,7 +47,7 @@ class RoboTwinPrimitives:
         self,
         *,
         env: RoboTwinEnvClient,
-        model: LingBotVLAClient,
+        model: LingBotVLAClient | None = None,
         seed: int,
         check_cancelled: Callable[[], None],
         seed_mode: str = "exact",
@@ -201,6 +201,8 @@ class RoboTwinPrimitives:
         self, *, chunks: int = 4, use_length: int = 50, prompt: str | None = None
     ) -> dict[str, Any]:
         """Infer and execute up to the requested number of LingBot EEF action chunks."""
+        if self.model is None:
+            raise RuntimeError("VLA is unavailable; configure a model client")
         if int(chunks) < 1:
             raise ValueError("chunks must be at least 1")
         if int(use_length) != MODEL_SPEC.use_length:

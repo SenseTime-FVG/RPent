@@ -39,12 +39,15 @@ logger = get_logger("robocasa_toolkit")
 class RoboCasaToolkit(Toolkit):
     """Toolkit for the RoboCasa robot."""
 
+    VLA_TOOLS = frozenset({"rldx_skill", "rldx_arm"})
+
     def __init__(
         self,
         *,
         runtime_kwargs: dict[str, Any],
         dashboard_events: DashboardEventSink,
         memory: MemoryManager,
+        enable_vla: bool = True,
         mode: str = "evaluation",
         attempts_per_session: int = 0,
         state_output_dir: Path | str | None = None,
@@ -59,6 +62,9 @@ class RoboCasaToolkit(Toolkit):
             memory=memory,
         )
         self._mode = mode
+        self._enable_vla = enable_vla and runtime_kwargs.get("vla_client") is not None
+        if not self._enable_vla:
+            runtime_kwargs = {**runtime_kwargs, "vla_client": None}
         self._attempt = 1
         self._attempts_per_session = max(0, int(attempts_per_session))
         self.init_primitives(
@@ -83,6 +89,8 @@ class RoboCasaToolkit(Toolkit):
         }
         for spec in robocasa_tools.TOOLS_SPEC:
             name = spec["name"]
+            if name in self.VLA_TOOLS and not self._enable_vla:
+                continue
             if name in state_handlers:
                 handler = state_handlers[name]
             elif name == "finish":
@@ -154,17 +162,45 @@ class RoboCasaToolkit(Toolkit):
             self._state,
             log={"command": command, "result": result, "elapsed_s": elapsed_s},
         )
-        if self._dashboard_events.enabled:
+        if self._dashboard_events.enabled or getattr(self, "capture_video", False):
             try:
                 frames = self._primitives.frame_slice(frame_start)
                 if frames:
                     candidate = f"action_{command['action']}.mp4"
-                    self._state.save(
+                    saved = self._state.save(
                         candidate,
                         frames,
                         step=record.step_idx,
                         fps=20,
                     )
+                    if saved is not None:
+                        clip_path = self._state.artifact_path(
+                            saved, step=record.step_idx
+                        )
+                        episode_path = self._state.artifact_path(
+                            "episode.mp4", step=None
+                        )
+                        self._state.update_step_extras(
+                            record.step_idx,
+                            {
+                                "videos": [
+                                    {
+                                        "video_ref": clip_path.relative_to(
+                                            episode_path.parent
+                                        ).as_posix(),
+                                        "frame_start": 0,
+                                        "frame_end": len(frames),
+                                        "fps": 20,
+                                    },
+                                    {
+                                        "video_ref": "episode.mp4",
+                                        "frame_start": frame_start,
+                                        "frame_end": self._action_frame_cursor,
+                                        "fps": 20,
+                                    },
+                                ],
+                            },
+                        )
             except Exception as e:
                 logger.warning(
                     "failed to save action clip for step %s: %s",

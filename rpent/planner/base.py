@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from pydantic_ai.models import Model
 
     from rpent.llm import LLMConfig
+    from rpent.runtime import RuntimeConfig
 
 #: MCP namespace prefix for RPent tools (``mcp__<server>__<tool>``).
 #: Toolkits expose plain tool names; planners add/strip this prefix.
@@ -182,6 +183,7 @@ def build_planner(
     claude_code_max_budget_usd: float | None = None,
     dashboard_events: DashboardEventSink,
     no_images: bool = False,
+    runtime: RuntimeConfig | None = None,
     include_image_reader: bool = True,
     require_tool_call: bool = False,
 ):
@@ -189,6 +191,12 @@ def build_planner(
     # Imports are deferred to avoid a circular import: api_loop / claude_code /
     # codex all import from this module (PlannerResult).
 
+    if runtime is not None and planner_type != "api":
+        raise ValueError("runtime is supported only by the api planner")
+    if runtime is not None and runtime.llm is not None:
+        if llm_config is not None or model is not None or base_url is not None:
+            raise ValueError("pass runtime.llm or llm_config/model/base_url, not both")
+        llm_config = runtime.llm
     if llm_config is not None and planner_type != "api":
         raise ValueError("llm_config is supported only by the api planner")
     if llm_config is not None and (model is not None or base_url is not None):
@@ -222,6 +230,7 @@ def build_planner(
             image_history_groups=(
                 llm_config.image_history_groups if llm_config is not None else None
             ),
+            runtime=runtime,
             preserve_initial_image_count=(
                 llm_config.preserve_initial_image_count if llm_config is not None else 0
             ),
